@@ -1,0 +1,242 @@
+edition 5;
+
+// Gate 1 (design section 9): the client codec against cancho-mqtt's `mqtt.wire`, which is the other implementation of the same
+// byte layout. Whatever this client encodes, the broker's decoder accepts and reads back the same fields; whatever the broker's
+// encoder writes, this client's decoder accepts and reads back the same fields.
+
+import std.test;
+import mqtt.wire;
+import mqttc.codec;
+
+// Is `text` exactly the `n` bytes at `off` of `whole`?
+fn same[&w, &t](whole: &w [byte], off: int, n: int, text: &t [byte]) -> [] bool {
+    if off < 0 || n != len(text) || off + n > len(whole) {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if int_of(whole[off + i]) != int_of(text[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The broker reads the kind and flags this client wrote as ones a client may send.
+fn accepted[&w](whole: &w [byte], kind: int) -> [] int {
+    test.assert_eq(wire.header(whole, 70000), len(whole));
+    test.assert_eq(wire.kind(whole), kind);
+    test.assert_eq(wire.check_kind(wire.kind(whole), wire.flags(whole)), 0);
+    return 0;
+}
+
+pub fn test_client_connect_is_read_by_the_broker() -> [] int {
+    region a {
+        let b = alloc_slice[a](128, byte_of(0));
+        let t = alloc_slice[a](wire.connect_slots(), 0 - 1);
+        // Minimal.
+        var n = codec.put_connect(b, 0, "c", 60, true, "", "", "", "", 0, 0);
+        accepted(b[0..n], 1);
+        test.assert_eq(wire.decode_connect(b[0..n], t), 0);
+        test.assert_eq(t[wire.c_level()], 4);
+        test.assert_eq(t[wire.c_flags()], 2);
+        test.assert_eq(t[wire.c_keepalive()], 60);
+        test.assert(same(b[0..n], t[wire.c_id()], t[wire.c_id() + 1], "c"));
+        // Everything: user, password, will with QoS 1 and retain, no clean session.
+        n = codec.put_connect(b, 0, "id", 10, false, "u", "p", "w/t", "bye", 1, 1);
+        accepted(b[0..n], 1);
+        test.assert_eq(wire.decode_connect(b[0..n], t), 0);
+        test.assert_eq(t[wire.c_flags()], 236);
+        test.assert_eq(t[wire.c_keepalive()], 10);
+        test.assert(same(b[0..n], t[wire.c_id()], t[wire.c_id() + 1], "id"));
+        test.assert(same(b[0..n], t[wire.c_will_topic()], t[wire.c_will_topic() + 1], "w/t"));
+        test.assert(same(b[0..n], t[wire.c_will_message()], t[wire.c_will_message() + 1], "bye"));
+        test.assert(same(b[0..n], t[wire.c_user()], t[wire.c_user() + 1], "u"));
+        test.assert(same(b[0..n], t[wire.c_pass()], t[wire.c_pass() + 1], "p"));
+        // An empty client id with a clean session.
+        n = codec.put_connect(b, 0, "", 0, true, "", "", "", "", 0, 0);
+        accepted(b[0..n], 1);
+        test.assert_eq(wire.decode_connect(b[0..n], t), 0);
+        test.assert_eq(t[wire.c_id() + 1], 0);
+        // A user without a password.
+        n = codec.put_connect(b, 0, "c", 1, true, "user", "", "", "", 0, 0);
+        accepted(b[0..n], 1);
+        test.assert_eq(wire.decode_connect(b[0..n], t), 0);
+        test.assert(same(b[0..n], t[wire.c_user()], t[wire.c_user() + 1], "user"));
+    }
+    return 0;
+}
+
+pub fn test_client_publish_is_read_by_the_broker() -> [] int {
+    region a {
+        let b = alloc_slice[a](128, byte_of(0));
+        let t = alloc_slice[a](wire.publish_slots(), 0 - 1);
+        var qos = 0;
+        while qos < 2 {
+            var retain = 0;
+            while retain < 2 {
+                var dup = 0;
+                while dup < 2 {
+                    if qos == 1 || dup == 0 {
+                        let n = codec.put_publish(b, 0, "plant/line1/temp", "21.5", qos, retain, dup, 300 * qos);
+                        accepted(b[0..n], 3);
+                        test.assert_eq(wire.decode_publish(b[0..n], t), 0);
+                        test.assert(same(b[0..n], t[wire.p_topic()], t[wire.p_topic() + 1], "plant/line1/temp"));
+                        test.assert(same(b[0..n], t[wire.p_payload()], t[wire.p_payload() + 1], "21.5"));
+                        test.assert_eq(t[wire.p_qos()], qos);
+                        test.assert_eq(t[wire.p_retain()], retain);
+                        test.assert_eq(t[wire.p_dup()], dup);
+                        test.assert_eq(t[wire.p_pid()], 300 * qos);
+                    }
+                    dup = dup + 1;
+                }
+                retain = retain + 1;
+            }
+            qos = qos + 1;
+        }
+        // An empty payload, and a payload long enough for a two-byte remaining length.
+        var n = codec.put_publish(b, 0, "t", "", 0, 0, 0, 0);
+        test.assert_eq(wire.decode_publish(b[0..n], t), 0);
+        test.assert_eq(t[wire.p_payload() + 1], 0);
+        let big = alloc_slice[a](400, byte_of(120));
+        let out = alloc_slice[a](512, byte_of(0));
+        n = codec.put_publish(out, 0, "t", big, 1, 0, 0, 65535);
+        accepted(out[0..n], 3);
+        test.assert_eq(wire.decode_publish(out[0..n], t), 0);
+        test.assert_eq(t[wire.p_payload() + 1], 400);
+        test.assert_eq(t[wire.p_pid()], 65535);
+    }
+    return 0;
+}
+
+pub fn test_client_subscribe_is_read_by_the_broker() -> [] int {
+    region a {
+        let b = alloc_slice[a](128, byte_of(0));
+        let f = alloc_slice[a](16, byte_of(0));
+        let t = alloc_slice[a](3 * 2, 0);
+        let bt = alloc_slice[a](wire.filter_slots(), 0 - 1);
+        // "a/#" at 0 and "b/+" at 3.
+        f[0] = byte_of(97);
+        f[1] = byte_of(47);
+        f[2] = byte_of(35);
+        f[3] = byte_of(98);
+        f[4] = byte_of(47);
+        f[5] = byte_of(43);
+        t[0] = 0;
+        t[1] = 3;
+        t[2] = 0;
+        t[3] = 3;
+        t[4] = 3;
+        t[5] = 1;
+        var n = codec.put_subscribe(b, 0, 4660, f, t, 2);
+        accepted(b[0..n], 8);
+        test.assert_eq(wire.decode_filters(b[0..n], bt, true), 0);
+        test.assert_eq(bt[0], 4660);
+        test.assert_eq(bt[1], 2);
+        test.assert(same(b[0..n], bt[2], bt[3], "a/#"));
+        test.assert_eq(bt[4], 0);
+        test.assert(same(b[0..n], bt[5], bt[6], "b/+"));
+        test.assert_eq(bt[7], 1);
+        n = codec.put_unsubscribe(b, 0, 9, f, t, 2);
+        accepted(b[0..n], 10);
+        test.assert_eq(wire.decode_filters(b[0..n], bt, false), 0);
+        test.assert_eq(bt[0], 9);
+        test.assert_eq(bt[1], 2);
+        test.assert(same(b[0..n], bt[2], bt[3], "a/#"));
+        test.assert(same(b[0..n], bt[5], bt[6], "b/+"));
+    }
+    return 0;
+}
+
+pub fn test_client_small_packets_are_read_by_the_broker() -> [] int {
+    region a {
+        let b = alloc_slice[a](16, byte_of(0));
+        var n = codec.put_puback(b, 0, 258);
+        accepted(b[0..n], 4);
+        test.assert_eq(wire.decode_puback(b[0..n]), 258);
+        n = codec.put_pingreq(b, 0);
+        accepted(b[0..n], 12);
+        test.assert_eq(wire.decode_empty(b[0..n]), 0);
+        n = codec.put_disconnect(b, 0);
+        accepted(b[0..n], 14);
+        test.assert_eq(wire.decode_empty(b[0..n]), 0);
+    }
+    return 0;
+}
+
+pub fn test_broker_packets_are_read_by_the_client() -> [] int {
+    region a {
+        let b = alloc_slice[a](600, byte_of(0));
+        let ct = alloc_slice[a](codec.connack_slots(), 0 - 1);
+        let pt = alloc_slice[a](codec.publish_slots(), 0 - 1);
+        let st = alloc_slice[a](codec.suback_slots(), 0 - 1);
+        // CONNACK: every return code, and a session present with an accepted connection.
+        var code = 0;
+        while code < 6 {
+            let n = wire.put_connack(b, 0, 0, code);
+            test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), 0);
+            test.assert_eq(codec.decode_connack(b[0..n], ct), 0);
+            test.assert_eq(ct[0], 0);
+            test.assert_eq(ct[1], code);
+            code = code + 1;
+        }
+        var n = wire.put_connack(b, 0, 1, 0);
+        test.assert_eq(codec.decode_connack(b[0..n], ct), 0);
+        test.assert_eq(ct[0], 1);
+        // PUBLISH at QoS 0 and 1, retained or not.
+        var qos = 0;
+        while qos < 2 {
+            var retain = 0;
+            while retain < 2 {
+                n = wire.put_publish(b, 0, "plant/line1/temp", "21.5", qos, retain, qos, 77 * qos);
+                test.assert_eq(codec.header(b[0..n], 70000), n);
+                test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), 0);
+                test.assert_eq(codec.decode_publish(b[0..n], pt), 0);
+                test.assert(same(b[0..n], pt[codec.p_topic()], pt[codec.p_topic_len()], "plant/line1/temp"));
+                test.assert(same(b[0..n], pt[codec.p_payload()], pt[codec.p_payload_len()], "21.5"));
+                test.assert_eq(pt[codec.p_qos()], qos);
+                test.assert_eq(pt[codec.p_retain()], retain);
+                test.assert_eq(pt[codec.p_dup()], qos);
+                test.assert_eq(pt[codec.p_pid()], 77 * qos);
+                retain = retain + 1;
+            }
+            qos = qos + 1;
+        }
+        // QoS 2 PUBLISH: the broker may send it; this client refuses it by its own rule.
+        n = wire.put_publish(b, 0, "t", "x", 2, 0, 0, 5);
+        test.assert_eq(codec.decode_publish(b[0..n], pt), codec.e_qos2());
+        // SUBACK.
+        let codes = alloc_slice[a](4, 0);
+        codes[0] = 0;
+        codes[1] = 1;
+        codes[2] = 2;
+        codes[3] = 128;
+        n = wire.put_suback(b, 0, 4660, codes, 4);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), 0);
+        test.assert_eq(codec.decode_suback(b[0..n], st), 0);
+        test.assert_eq(st[0], 4660);
+        test.assert_eq(st[1], 4);
+        test.assert_eq(st[2], 0);
+        test.assert_eq(st[3], 1);
+        test.assert_eq(st[4], 2);
+        test.assert_eq(st[5], 128);
+        // PUBACK, UNSUBACK, PINGRESP.
+        n = wire.put_puback(b, 0, 258);
+        test.assert_eq(codec.decode_pid(b[0..n]), 258);
+        n = wire.put_unsuback(b, 0, 259);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), 0);
+        test.assert_eq(codec.decode_pid(b[0..n]), 259);
+        n = wire.put_pingresp(b, 0);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), 0);
+        test.assert_eq(codec.decode_empty(b[0..n]), 0);
+        // The QoS 2 handshake packets are the client's own refusal.
+        n = wire.put_pubrec(b, 0, 1);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), codec.e_qos2());
+        n = wire.put_pubrel(b, 0, 1);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), codec.e_qos2());
+        n = wire.put_pubcomp(b, 0, 1);
+        test.assert_eq(codec.check_kind(codec.kind(b[0..n]), codec.flags(b[0..n])), codec.e_qos2());
+    }
+    return 0;
+}
