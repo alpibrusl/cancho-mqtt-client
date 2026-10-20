@@ -10,6 +10,8 @@ env:
   # implementation of the byte layout (design section 9, gate 1): the commit cancho-industrial's bundle.toml pins.
   CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
+  # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
+  BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
 
 jobs:
   gate:
@@ -49,7 +51,7 @@ jobs:
 
       - name: Format
         working-directory: client
-        run: ${{ github.workspace }}/cancho/target/release/cancho fmt --check src tests
+        run: ${{ github.workspace }}/cancho/target/release/cancho fmt --check src tests examples
 
       - name: Gates 1, 2 and 6, the tests (the codec's own and against cancho-mqtt's wire)
         working-directory: client
@@ -57,11 +59,41 @@ jobs:
           C=${{ github.workspace }}/cancho/target/release/cancho
           $C test src/codec.cho tests/codec_test.cho --std
           $C test ../cancho-mqtt/src/wire.cho src/codec.cho tests/broker_test.cho --std
+          $C test src/codec.cho src/client.cho tests/client_test.cho --std
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/cancho
+          ref: ${{ env.BROKER_COMPILER_REV }}
+          path: cancho-for-broker
+
+      - name: Cache the broker's compiler and the broker
+        id: broker
+        uses: actions/cache@v4
+        with:
+          path: |
+            cancho-for-broker/target/release/cancho
+            cancho-mqtt/build/mqtt
+          key: broker-${{ env.BROKER_COMPILER_REV }}-${{ env.BROKER_REV }}
+
+      - name: Build the broker with its own compiler
+        if: steps.broker.outputs.cache-hit != 'true'
+        run: |
+          (cd cancho-for-broker && cargo build --release -p cancho)
+          (cd cancho-mqtt && ${{ github.workspace }}/cancho-for-broker/target/release/cancho build)
+
+      - name: Gate 3, the examples against the real broker
+        working-directory: client
+        env:
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
+          BROKER: ${{ github.workspace }}/cancho-mqtt/build/mqtt
+        run: scripts/e2e.sh
 
       - name: Gate 7, every variant must be killed
         working-directory: client
         env:
           CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
+          BROKER: ${{ github.workspace }}/cancho-mqtt/build/mqtt
         run: python3 scripts/mutants.py
 
       - name: Gate 8, lines

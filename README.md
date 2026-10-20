@@ -4,7 +4,7 @@ An MQTT 3.1.1 client library for [cancho](https://github.com/alpibrusl/cancho), 
 QoS 0 and 1, and a reconnect with a bounded backoff. The other half of [cancho-mqtt](https://github.com/alpibrusl/cancho-mqtt): a cancho
 program can publish and subscribe without an external client.
 
-**Status: slice 1 built: the packet codec (both directions) with its gates. The client state machine is not built.** The plan is [docs/design.md](docs/design.md), written before the code; its gates are fixed
+**Status: slices 1 and 2 built: the packet codec and the client state machine (connect, QoS 0 publish, subscribe, ping, disconnect), with two example programs run against a real cancho-mqtt. QoS 1 publishing, will/retain handling, reconnect and the package store are not built.** The plan is [docs/design.md](docs/design.md), written before the code; its gates are fixed
 there and each is shown failing against a deliberately broken variant (`scripts/mutants.py`). The first user is the ingest and simulator of the PoC
 platform in [cancho-industrial](https://github.com/alpibrusl/cancho-industrial) (issue #7).
 
@@ -21,6 +21,8 @@ layout; CI uses the commit cancho-industrial pins). Then:
 ```sh
 cancho test src/codec.cho tests/codec_test.cho --std                          # the codec's own tests
 cancho test ../cancho-mqtt/src/wire.cho src/codec.cho tests/broker_test.cho --std   # gate 1, against the broker's decoder and encoder
-CANCHO=$(which cancho) python3 scripts/mutants.py                            # gate 7: every variant must be killed
-cancho fmt --check src tests && python3 scripts/lines.py
+BROKER=/path/to/mqtt CANCHO=$(which cancho) python3 scripts/mutants.py                            # gate 7: every variant must be killed
+cancho test src/codec.cho src/client.cho tests/client_test.cho --std          # the state machine
+BROKER=/path/to/mqtt scripts/e2e.sh                                       # gate 3, the examples against a real broker
+cancho fmt --check src tests examples && python3 scripts/lines.py
 ```

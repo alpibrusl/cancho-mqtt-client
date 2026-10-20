@@ -1,0 +1,60 @@
+edition 5;
+
+// `examples.pump` -- the socket half of the two example programs: write what the machine appended to `out`, read what the broker sent
+// and `feed` it. This is the caller's side of `docs/design.md` section 4, kept out of the library because the library owns no socket.
+// The reads block (the examples set no keep-alive); a program with a loop of its own uses a `Poller` and `tick`.
+
+module examples.pump;
+
+import std.buffer;
+import mqttc.client;
+
+// Write all of `out` to the connection, then forget it. True if every byte went.
+pub fn send_out[&c](conn: &!c Conn, out: buffer.Buffer) -> [conn_write] (buffer.Buffer, bool) {
+    var o = out;
+    var ok = true;
+    borrow o as &ob in {
+        let bytes = buffer.bytes(ob);
+        var at = 0;
+        while at < len(bytes) && ok {
+            match conn_write(conn, bytes[at..len(bytes)]) {
+                Sent::Wrote(w) => {
+                    at = at + w;
+                }
+                Sent::Again => {
+                    ok = false;
+                }
+                Sent::Failed(e) => {
+                    ok = false;
+                }
+            }
+        }
+    }
+    borrow mut o as &!ow in {
+        buffer.clear(ow);
+    }
+    return (o, ok);
+}
+
+// Read once (blocking) and feed the machine what arrived. Answers the machine, `out`, how many events were written, and a status: 0
+// the bytes were fed, 1 the broker closed the connection, 2 the read failed.
+pub fn pump[&h, &c, &e](heap: &!h Heap, conn: &!c Conn, c: client.Client, now: int, events: &!e [int], out: buffer.Buffer) -> [heap, conn_read] (client.Client, buffer.Buffer, int, int) {
+    region a {
+        let buf = alloc_slice[a](4096, byte_of(0));
+        match conn_read(conn, buf) {
+            Received::Data(k) => {
+                let (c1, o1, n) = client.feed(heap, c, buf[0..k], now, events, out);
+                return (c1, o1, n, 0);
+            }
+            Received::End => {
+                return (c, out, 0, 1);
+            }
+            Received::Again => {
+                return (c, out, 0, 2);
+            }
+            Received::Failed(e2) => {
+                return (c, out, 0, 2);
+            }
+        }
+    }
+}

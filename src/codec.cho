@@ -66,6 +66,16 @@ pub fn e_filters() -> [] int {
     return 0 - 16;
 }
 
+// The client is not in the state an operation needs (a publish before CONNACK).
+pub fn e_state() -> [] int {
+    return 0 - 17;
+}
+
+// No packet from the broker within the keep-alive and its grace (design section 6).
+pub fn e_keepalive() -> [] int {
+    return 0 - 18;
+}
+
 // The rule tag of a refusal code (design section 6); "client.unknown" for a code that is none.
 pub fn tag_of(code: int) -> [] &static [byte] {
     if code == 0 - 2 || code == 0 - 10 {
@@ -91,6 +101,12 @@ pub fn tag_of(code: int) -> [] &static [byte] {
     }
     if code == 0 - 16 {
         return "client.too-many-filters";
+    }
+    if code == 0 - 17 {
+        return "client.not-connected";
+    }
+    if code == 0 - 18 {
+        return "client.keepalive-timeout";
     }
     return "client.unknown";
 }

@@ -1,0 +1,135 @@
+edition 5;
+
+// `pub` -- connect to a broker, publish one message at QoS 0, disconnect.
+//
+//     pub <ipv4> <port> <topic> <payload> [<client-id>]
+//
+// Exit status: 0 published; 2 wrong arguments; 3 the broker refused the connection or sent something the client refused; 4 could not
+// connect; 5 the connection failed. The example of `docs/design.md` section 11, slice 2; it is a program, so its authority row is its own:
+// `net_out` for the connection and nothing else (`cancho authority`).
+
+import std.buffer;
+import std.io;
+import mqttc.codec;
+import mqttc.client;
+import examples.pump;
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 5 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], payload: &p [byte], id: &i [byte]) -> [heap, conn_read, conn_write] int {
+    let ev = box_slice(heap, 6 * 4, 0);
+    let c0 = client.new(heap, 65536);
+    let (c1, o1, rc) = client.open(heap, c0, buffer.empty(heap, 64), id, 0, true, "", "", "", "", 0, 0, 0);
+    var status = 0;
+    var cl = c1;
+    var out = o1;
+    if rc != 0 {
+        status = 3;
+    }
+    if status == 0 {
+        let (o2, sent) = pump.send_out(conn, out);
+        out = o2;
+        if !sent {
+            status = 5;
+        }
+    }
+    // Wait for CONNACK.
+    var waiting = status == 0;
+    while waiting {
+        borrow mut ev as &!ew in {
+            let (c2, o3, n, s) = pump.pump(heap, conn, cl, 0, contents(ew), out);
+            cl = c2;
+            out = o3;
+            if s != 0 {
+                status = 5;
+                waiting = false;
+            } else if n > 0 {
+                if contents(ew)[0] == client.ev_connected() {
+                    waiting = false;
+                } else {
+                    status = 3;
+                    waiting = false;
+                }
+            }
+        }
+    }
+    if status == 0 {
+        let (c3, o4, r1) = client.publish(heap, cl, out, topic, payload, 0, 0, 0);
+        cl = c3;
+        out = o4;
+        if r1 != 0 {
+            status = 3;
+        }
+        let (o5, sent2) = pump.send_out(conn, out);
+        out = o5;
+        if !sent2 {
+            status = 5;
+        }
+        let (c4, o6, r2) = client.disconnect(heap, cl, out, 0);
+        cl = c4;
+        out = o6;
+        let (o7, sent3) = pump.send_out(conn, out);
+        out = o7;
+    }
+    client.drop(heap, cl);
+    buffer.drop(heap, out);
+    unbox_slice(heap, ev);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    release(clock);
+    var status = 2;
+    borrow args as &g in {
+        if arg_count(g) >= 5 {
+            let port = number_of(arg(g, 2));
+            if port > 0 && port < 65536 {
+                status = 4;
+                borrow net as &nn in {
+                    match tcp_connect(nn, arg(g, 1), port) {
+                        Dialed::Ok(cn) => {
+                            var conn = cn;
+                            borrow mut conn as &!ch in {
+                                borrow mut heap as &!h in {
+                                    var id = "pub";
+                                    if arg_count(g) >= 6 {
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), arg(g, 5));
+                                    } else {
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), id);
+                                    }
+                                }
+                            }
+                            conn_close(conn);
+                        }
+                        Dialed::Failed(e) => {
+                            status = 4;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

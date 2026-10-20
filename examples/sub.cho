@@ -1,0 +1,165 @@
+edition 5;
+
+// `sub` -- connect to a broker, subscribe to one filter at QoS 0, print the first <count> messages as `topic payload` lines, disconnect.
+//
+//     sub <ipv4> <port> <filter> <count> [<client-id>]
+//
+// Exit status: 0 <count> messages printed; 2 wrong arguments; 3 the broker refused or the client refused what the broker sent;
+// 4 could not connect; 5 the connection failed. The reads block and no keep-alive is set, so it waits for as long as the broker is quiet.
+
+import std.buffer;
+import std.io;
+import mqttc.codec;
+import mqttc.client;
+import examples.pump;
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 5 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn run[&h, &c, &f, &i, &o](heap: &!h Heap, conn: &!c Conn, con: &!o Io, filter: &f [byte], want: int, id: &i [byte]) -> [heap, conn_read, conn_write, io_write] int {
+    let ev = box_slice(heap, 6 * 8, 0);
+    let c0 = client.new(heap, 65536);
+    let (c1, o1, rc) = client.open(heap, c0, buffer.empty(heap, 64), id, 0, true, "", "", "", "", 0, 0, 0);
+    var status = 0;
+    var cl = c1;
+    var out = o1;
+    if rc != 0 {
+        status = 3;
+    }
+    if status == 0 {
+        let (o2, sent) = pump.send_out(conn, out);
+        out = o2;
+        if !sent {
+            status = 5;
+        }
+    }
+    var subscribed = false;
+    var printed = 0;
+    var running = status == 0;
+    while running {
+        borrow mut ev as &!ew in {
+            let (c2, o3, n, s) = pump.pump(heap, conn, cl, 0, contents(ew), out);
+            cl = c2;
+            out = o3;
+            if s != 0 {
+                status = 5;
+                running = false;
+            }
+            var k = 0;
+            while k < n && running {
+                let e = contents(ew);
+                let kind = e[6 * k];
+                if kind == client.ev_connected() && !subscribed {
+                    // Subscribe once CONNACK is in.
+                    region a {
+                        let table = alloc_slice[a](3, 0);
+                        table[1] = len(filter);
+                        let (c3, o4, pid) = client.subscribe(heap, cl, out, filter, table, 1, 0);
+                        cl = c3;
+                        out = o4;
+                        if pid < 0 {
+                            status = 3;
+                            running = false;
+                        }
+                    }
+                    subscribed = true;
+                    let (o5, sent2) = pump.send_out(conn, out);
+                    out = o5;
+                    if !sent2 {
+                        status = 5;
+                        running = false;
+                    }
+                } else if kind == client.ev_message() {
+                    borrow cl as &cr in {
+                        let box = client.inbox(cr);
+                        io.write_all(con, box[e[6 * k + 1]..e[6 * k + 1] + e[6 * k + 2]]);
+                        io.write_all(con, " ");
+                        io.write_all(con, box[e[6 * k + 3]..e[6 * k + 3] + e[6 * k + 4]]);
+                        io.write_all(con, "\n");
+                    }
+                    printed = printed + 1;
+                    if printed >= want {
+                        running = false;
+                    }
+                } else if kind == client.ev_refused() || kind == client.ev_connack_refused() {
+                    status = 3;
+                    running = false;
+                }
+                k = k + 1;
+            }
+            borrow mut cl as &!cw in {
+                client.clear_inbox(cw);
+            }
+        }
+    }
+    if status == 0 {
+        let (c4, o6, r2) = client.disconnect(heap, cl, out, 0);
+        cl = c4;
+        out = o6;
+        let (o7, sent3) = pump.send_out(conn, out);
+        out = o7;
+    }
+    client.drop(heap, cl);
+    buffer.drop(heap, out);
+    unbox_slice(heap, ev);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    release(clock);
+    var status = 2;
+    borrow args as &g in {
+        if arg_count(g) >= 5 {
+            let port = number_of(arg(g, 2));
+            let want = number_of(arg(g, 4));
+            if port > 0 && port < 65536 && want > 0 {
+                status = 4;
+                borrow net as &nn in {
+                    match tcp_connect(nn, arg(g, 1), port) {
+                        Dialed::Ok(cn) => {
+                            var conn = cn;
+                            borrow mut conn as &!ch in {
+                                borrow mut heap as &!h in {
+                                    borrow mut io as &!i in {
+                                        var id = "sub";
+                                        if arg_count(g) >= 6 {
+                                            status = run(h, ch, i, arg(g, 3), want, arg(g, 5));
+                                        } else {
+                                            status = run(h, ch, i, arg(g, 3), want, id);
+                                        }
+                                    }
+                                }
+                            }
+                            conn_close(conn);
+                        }
+                        Dialed::Failed(e) => {
+                            status = 4;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(args);
+    release(io);
+    release(heap);
+    return status;
+}

@@ -1,6 +1,6 @@
 # cancho-mqtt-client: design
 
-> **Status: slice 1 built (the codec); the state machine is not.** Claims are read from a named file, measured (with the command), or
+> **Status: slices 1 and 2 built (the codec; the state machine for connect, QoS 0 publish, subscribe, ping, disconnect, with two example programs).** Claims are read from a named file, measured (with the command), or
 > marked **choice** or **open**. Section 11 says what is built; section 10 says which probes are answered. A claim found false is
 > corrected in place and marked *(corrected)*.
 
@@ -147,6 +147,11 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 
 1. At the pinned compiler: what `step` can look like (state by value, caller-owned buffers, a bounded events list); does a `res struct`
    with several buffers pass through a loop, as `platform/` does with its stores.
+   *Answered (slice 2):* yes, with a different shape than the sketch of section 4. There is no single `step`: a `pub res struct Client` is
+   threaded by value through `open`, `feed`, `publish`, `subscribe`, `unsubscribe`, `tick` and `disconnect`, each answering the machine, the
+   caller's `out` buffer and a code or a count. A `res` field cannot be read out of a value, so each function reads what it needs inside a
+   `borrow` and takes the struct apart with a destructuring `let` to rebuild it (the same shape as `platform/`'s stores). `connect` is a
+   builtin name, so the function is `open`.
 2. The memory formula: measure the state at several `Config`s; fix the defaults of section 5 from that.
 3. How a program reads a partial packet from a non-blocking connection at this pin (`cancho-pg`'s pool is the worked example).
 4. What cancho-mqtt's conformance fixtures offer to import for gate 2, and whether they can run unchanged.
@@ -159,8 +164,8 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 
 ## 11. Slices
 
-(1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`, 11 tests of its own, 5 against the broker's `mqtt.wire`, 12
-mutants all killed; see below)**; (2) the state machine: connect, publish QoS 0, subscribe, ping, with `pub`/`sub`;
+(1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`)**; (2) the state machine: connect, publish QoS 0,
+subscribe, ping, with `pub`/`sub` **(built: `src/client.cho`, `examples/`; see section 14)**;
 (3) QoS 1 and the window; (4) will and retained; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
 ingest and simulator (in cancho-industrial, not here).
 
@@ -185,3 +190,30 @@ library has none until an example program uses it) and gate 6 beyond the codec; 
 Found while building it: a failed `test.assert_eq` ends the test the way a trap does (`killed by signal 4`), so a wrong expectation in a test
 looks like a crash of the code under test; read the assertion before suspecting the codec. `a/` is a valid topic filter (an empty last
 level), which the first version of a test got wrong.
+
+## 14. What slice 2 built, and what it did not
+
+Built: `src/client.cho` (module `mqttc.client`): `new`, `open` (CONNECT), `feed` (bytes in; events out; a PUBACK appended for an incoming
+QoS 1 message), `publish` (QoS 0), `subscribe`, `unsubscribe`, `tick` (a PINGREQ at the keep-alive, the broker declared silent after half a
+keep-alive of grace, at least a second), `disconnect`, `inbox`/`clear_inbox`. `examples/pub.cho` and `examples/sub.cho` with `examples/pump.cho`
+(the socket half, kept out of the library). Tests: `tests/client_test.cho` (11, driving the machine with packets written as hex, including a
+packet fed in fragments, a full event table, the keep-alive clock, eight broker refusals, and a sweep of 300 random machines of 12 random
+steps each); `scripts/e2e.sh` (the examples against a real cancho-mqtt: `sub` on `plant/#` printed the two messages published under it and
+not the one published elsewhere, and the broker logged no refusal); `scripts/mutants.py` now has 21 variants of the codec and the machine,
+all killed, and 1 equivalent variant written down with its reason.
+
+Choices made, not in the sketch above: any packet from the broker clears an outstanding ping (not only PINGRESP); events are `[kind, a, b, c,
+d, e]` in a caller-owned table, and when the table fills the rest of the input stays inside the machine until `feed` is called again with no
+bytes; received topics and payloads are copied into an `inbox` the events point into.
+
+Not built, and not claimed: QoS 1 publishing, its window and its retries (slice 3: `publish` with QoS 1 answers `client.bad-argument`); will
+and retained handling beyond what CONNECT and PUBLISH already carry (slice 4); reconnect and backoff (slice 5); the package store (slice 6);
+Mosquitto as the second broker of gate 3 (it is not installed in the environment this was built in); gate 4; the memory formula of section 5.
+
+**Corrected in place.** Section 5 said the state is "a fixed-size structure sized from the `Config` at construction". What is built is two
+growable buffers: `rx`, bounded by `max_packet` (a header that declares more is refused before its body is read), and `inbox`, which grows
+with every received message until the caller calls `clear_inbox`. The examples clear it after every `feed`; a caller that does not can make
+it grow without bound. A cap on the inbox, and `memory_bytes`, are the open items of section 5.
+
+Found while building it: the examples' reads block, so the keep-alive cannot fire while they wait; they set no keep-alive. A program with a
+loop of its own (a `Poller`, as the platform's ingest will have) calls `tick` and waits at most what it answers.
