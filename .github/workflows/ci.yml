@@ -6,9 +6,11 @@ on:
   pull_request:
 
 env:
+  # NOT named CANCHO_REV: cancho's build script stamps the compiler with that variable when it is set, so a workflow-level CANCHO_REV would make
+  # the broker's compiler (built below) claim to be this one, and `cancho build` of the broker would refuse it.
   # The compiler these sources are written for (also cancho.toml's `cancho`), and the cancho-mqtt commit whose `mqtt.wire` is the other
   # implementation of the byte layout (design section 9, gate 1): the commit cancho-industrial's bundle.toml pins.
-  CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
+  CLIENT_COMPILER_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
   # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
   BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
@@ -24,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: alpibrusl/cancho
-          ref: ${{ env.CANCHO_REV }}
+          ref: ${{ env.CLIENT_COMPILER_REV }}
           path: cancho
 
       - uses: actions/checkout@v4
@@ -35,14 +37,14 @@ jobs:
 
       - name: The compiler pin in cancho.toml is the one CI builds
         working-directory: client
-        run: grep -q "$CANCHO_REV" cancho.toml
+        run: grep -q "$CLIENT_COMPILER_REV" cancho.toml
 
       - name: Cache the compiler
         id: compiler
         uses: actions/cache@v4
         with:
           path: cancho/target/release/cancho
-          key: cancho-${{ env.CANCHO_REV }}
+          key: cancho-${{ env.CLIENT_COMPILER_REV }}
 
       - name: Build cancho
         if: steps.compiler.outputs.cache-hit != 'true'
