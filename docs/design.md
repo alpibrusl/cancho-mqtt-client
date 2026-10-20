@@ -173,7 +173,7 @@ ingest and simulator (in cancho-industrial, not here).
 ## 13. What slice 1 built, and what it did not
 
 Built: `src/codec.cho` (module `mqttc.codec`), the packets of section 1 in both directions; `tests/codec_test.cho` (packets written as hex, so
-they do not depend on the encoder; a sweep of every prefix, every one-byte deletion and 15 one-byte changes per position of 8 valid packets, then 4,000
+they do not depend on the encoder; a sweep of every prefix, every one-byte deletion and 16 one-byte changes per position of 8 valid packets, then 4,000
 random buffers; 3,000 random argument sets for the encoders); `tests/broker_test.cho` (gate 1, both directions, against cancho-mqtt's
 `src/wire.cho` at the commit in `.github/workflows/ci.yml`); `scripts/mutants.py` (gate 7, 12 variants) and `scripts/lines.py` (gate 8).
 
