@@ -1,0 +1,18 @@
+# cancho-mqtt-client's project file: the compiler these sources are written for. The compiler revision is part of the contract
+# (a package store records no hash of the `std` it was published against); it is also CI's CANCHO_REV (design section 8).
+
+[package]
+name = "mqtt-client"
+cancho = "a4572ea3b506e4bcec1c4be43deda1043c11ba9f"
+
+[[test]]
+name = "codec"
+sources = ["src/codec.cho", "tests/codec_test.cho"]
+std = true
+
+# Gate 1: the other implementation of the byte layout is cancho-mqtt's `mqtt.wire`, from a checkout beside this one at the commit
+# `bundle`-style pins name (docs/design.md section 9); CI checks the checkout is at that commit.
+[[test]]
+name = "broker"
+sources = ["../cancho-mqtt/src/wire.cho", "src/codec.cho", "tests/broker_test.cho"]
+std = true

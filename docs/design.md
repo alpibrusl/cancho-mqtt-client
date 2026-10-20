@@ -1,7 +1,7 @@
 # cancho-mqtt-client: design
 
-> **Status: design, written before any code.** Claims are read from a named file, measured (with the command), or marked **choice** or
-> **open**. Nothing here is built and nothing is measured yet; section 10 lists the probes that come first. A claim found false is
+> **Status: slice 1 built (the codec); the state machine is not.** Claims are read from a named file, measured (with the command), or
+> marked **choice** or **open**. Section 11 says what is built; section 10 says which probes are answered. A claim found false is
 > corrected in place and marked *(corrected)*.
 
 ## 1. Scope
@@ -99,6 +99,8 @@ cancho-mqtt does with `mqtt rules`):
 | `client.packet-too-large`, `client.topic-too-long`, `client.window-full`, `client.queue-full`, `client.too-many-filters` | section 5 |
 | `client.bad-topic` | a topic name with a wildcard, or an empty one, on publish; a filter that is not valid on subscribe |
 | `client.qos2-unsupported` | section 1 |
+| `client.bad-packet-id` | a packet id of 0, or outside 1 to 65535, where one is required *(added by slice 1: the codec needed it)* |
+| `client.bad-argument` | an encoder argument that breaks a rule: a QoS outside 0 and 1, a password with no user name, an empty client id without a clean session, a keep-alive outside 0 to 65535 *(added by slice 1)* |
 | `client.keepalive-timeout` | no PINGRESP or any packet within the keep-alive plus a grace |
 | `client.suback-failure` | the broker granted 0x80 for a filter |
 
@@ -148,12 +150,17 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 2. The memory formula: measure the state at several `Config`s; fix the defaults of section 5 from that.
 3. How a program reads a partial packet from a non-blocking connection at this pin (`cancho-pg`'s pool is the worked example).
 4. What cancho-mqtt's conformance fixtures offer to import for gate 2, and whether they can run unchanged.
+   *Answered in part (slice 1):* `mqtt.wire` itself compiles with the compiler this repository pins (`a4572ea`, the broker pins a newer one)
+   and its own 10 tests pass there: `cancho test src/wire.cho tests/wire_test.cho --std` in a cancho-mqtt checkout. That is what made a
+   differential against the real decoder possible without the broker's compiler. The broker's conformance fixtures (Python, over sockets)
+   were not looked at; they belong to gate 3.
 5. Whether Mosquitto's behaviour on a will, a retained message and a duplicate client id differs from the broker's in ways the client
    must tolerate (`docs/side-by-side.md` in cancho-mqtt records what the broker and Mosquitto both did).
 
 ## 11. Slices
 
-(1) the codec and its gates 1 and 2, no state machine; (2) the state machine: connect, publish QoS 0, subscribe, ping, with `pub`/`sub`;
+(1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`, 11 tests of its own, 5 against the broker's `mqtt.wire`, 12
+mutants all killed; see below)**; (2) the state machine: connect, publish QoS 0, subscribe, ping, with `pub`/`sub`;
 (3) QoS 1 and the window; (4) will and retained; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
 ingest and simulator (in cancho-industrial, not here).
 
@@ -162,3 +169,19 @@ ingest and simulator (in cancho-industrial, not here).
 1. The compiler pin: cancho-web's (`a4572ea`) or the broker's newer one (after the pin bump, cancho-industrial#3)?
 2. QoS 2 publishing: wanted for the PoC, or later?
 3. Is a `connect` helper in the library acceptable (it takes the caller's `Net`), or must the caller always hand in a connected stream?
+
+## 13. What slice 1 built, and what it did not
+
+Built: `src/codec.cho` (module `mqttc.codec`), the packets of section 1 in both directions; `tests/codec_test.cho` (packets written as hex, so
+they do not depend on the encoder; a sweep of every prefix, every one-byte deletion and 15 one-byte changes per position of 8 valid packets, then 4,000
+random buffers; 3,000 random argument sets for the encoders); `tests/broker_test.cho` (gate 1, both directions, against cancho-mqtt's
+`src/wire.cho` at the commit in `.github/workflows/ci.yml`); `scripts/mutants.py` (gate 7, 12 variants) and `scripts/lines.py` (gate 8).
+
+Not built, and not claimed: the state machine (`client.step`, section 4); the bounds of section 5 beyond the codec's own (`max_filters` is 16,
+the 16-bit string limit, the remaining-length limit); the rules `client.keepalive-timeout`, `client.suback-failure`, `client.window-full`,
+`client.queue-full`, `client.topic-too-long` (they belong to the machine); gate 3 (against two brokers), gate 4 (the caller's authority row; a
+library has none until an example program uses it) and gate 6 beyond the codec; the package store of section 8.
+
+Found while building it: a failed `test.assert_eq` ends the test the way a trap does (`killed by signal 4`), so a wrong expectation in a test
+looks like a crash of the code under test; read the assertion before suspecting the codec. `a/` is a valid topic filter (an empty last
+level), which the first version of a test got wrong.

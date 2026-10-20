@@ -1,0 +1,510 @@
+edition 5;
+
+import std.test;
+import mqttc.codec;
+
+// The value of one hex digit, or -1.
+fn nibble(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return 0 - 1;
+}
+
+// Write the bytes `hex` spells (two digits each) at the front of `dst`; answers how many. Packets are written as hex in these tests
+// so that they do not depend on the encoder.
+fn unhex[&d, &t](dst: &!d [byte], hex: &t [byte]) -> [] int {
+    var i = 0;
+    while i + 1 < len(hex) {
+        dst[i / 2] = byte_of(nibble(int_of(hex[i])) * 16 + nibble(int_of(hex[i + 1])));
+        i = i + 2;
+    }
+    return len(hex) / 2;
+}
+
+// Is the front `n` bytes of `got` exactly the bytes `hex` spells?
+fn matches[&g, &t](got: &g [byte], n: int, hex: &t [byte]) -> [] bool {
+    if n != len(hex) / 2 {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if int_of(got[i]) != nibble(int_of(hex[2 * i])) * 16 + nibble(int_of(hex[2 * i + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn test_header_lengths() -> [] int {
+    region a {
+        let b = alloc_slice[a](16, byte_of(0));
+        let n = unhex(b, "D000");
+        test.assert_eq(codec.header(b[0..n], 100), 2);
+        test.assert_eq(codec.kind(b[0..n]), 13);
+        test.assert_eq(codec.header(b[0..1], 100), codec.incomplete());
+        test.assert_eq(codec.header(b[0..0], 100), codec.incomplete());
+        // 127 and 128, the edge of one length byte.
+        unhex(b, "307F");
+        test.assert_eq(codec.header(b[0..2], 1000), 129);
+        unhex(b, "3080");
+        test.assert_eq(codec.header(b[0..2], 1000), codec.incomplete());
+        unhex(b, "308001");
+        test.assert_eq(codec.header(b[0..3], 1000), 131);
+        test.assert_eq(codec.header_size(b[0..3]), 3);
+        // The same value with a zero last byte is not minimal.
+        unhex(b, "308000");
+        test.assert_eq(codec.header(b[0..3], 1000), codec.bad_length());
+        // Five length bytes.
+        unhex(b, "30FFFFFFFF");
+        test.assert_eq(codec.header(b[0..5], 1000), codec.bad_length());
+        // Over the bound.
+        unhex(b, "307F");
+        test.assert_eq(codec.header(b[0..2], 100), codec.too_large());
+    }
+    return 0;
+}
+
+pub fn test_check_kind() -> [] int {
+    // What a client may receive.
+    test.assert_eq(codec.check_kind(2, 0), 0);
+    test.assert_eq(codec.check_kind(2, 1), codec.e_malformed());
+    test.assert_eq(codec.check_kind(3, 11), 0);
+    test.assert_eq(codec.check_kind(4, 0), 0);
+    test.assert_eq(codec.check_kind(9, 0), 0);
+    test.assert_eq(codec.check_kind(11, 0), 0);
+    test.assert_eq(codec.check_kind(13, 0), 0);
+    test.assert_eq(codec.check_kind(5, 0), codec.e_qos2());
+    test.assert_eq(codec.check_kind(6, 2), codec.e_qos2());
+    test.assert_eq(codec.check_kind(7, 0), codec.e_qos2());
+    test.assert_eq(codec.check_kind(1, 0), codec.e_unexpected());
+    test.assert_eq(codec.check_kind(8, 2), codec.e_unexpected());
+    test.assert_eq(codec.check_kind(12, 0), codec.e_unexpected());
+    test.assert_eq(codec.check_kind(14, 0), codec.e_unexpected());
+    test.assert_eq(codec.check_kind(0, 0), codec.e_malformed());
+    test.assert_eq(codec.check_kind(15, 0), codec.e_malformed());
+    return 0;
+}
+
+pub fn test_connack() -> [] int {
+    region a {
+        let b = alloc_slice[a](16, byte_of(0));
+        let t = alloc_slice[a](codec.connack_slots(), 0 - 1);
+        var n = unhex(b, "20020000");
+        test.assert_eq(codec.decode_connack(b[0..n], t), 0);
+        test.assert_eq(t[0], 0);
+        test.assert_eq(t[1], 0);
+        n = unhex(b, "20020100");
+        test.assert_eq(codec.decode_connack(b[0..n], t), 0);
+        test.assert_eq(t[0], 1);
+        // Refused: return code 5, no session present.
+        n = unhex(b, "20020005");
+        test.assert_eq(codec.decode_connack(b[0..n], t), 0);
+        test.assert_eq(t[1], 5);
+        // A reserved acknowledge bit, a return code of 6, a refusal with a session present, a short and a long body.
+        n = unhex(b, "20020200");
+        test.assert_eq(codec.decode_connack(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "20020006");
+        test.assert_eq(codec.decode_connack(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "20020103");
+        test.assert_eq(codec.decode_connack(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "200100");
+        test.assert_eq(codec.decode_connack(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "2003000000");
+        test.assert_eq(codec.decode_connack(b[0..n], t), codec.e_malformed());
+    }
+    return 0;
+}
+
+pub fn test_publish_decode() -> [] int {
+    region a {
+        let b = alloc_slice[a](64, byte_of(0));
+        let t = alloc_slice[a](codec.publish_slots(), 0);
+        // QoS 0: topic a/b, payload hi.
+        var n = unhex(b, "30070003612F626869");
+        test.assert_eq(codec.decode_publish(b[0..n], t), 0);
+        test.assert_eq(t[codec.p_topic()], 4);
+        test.assert_eq(t[codec.p_topic_len()], 3);
+        test.assert_eq(t[codec.p_payload()], 7);
+        test.assert_eq(t[codec.p_payload_len()], 2);
+        test.assert_eq(t[codec.p_qos()], 0);
+        test.assert_eq(t[codec.p_pid()], 0);
+        // QoS 1, retain, packet id 5.
+        n = unhex(b, "3306000174000578");
+        test.assert_eq(codec.decode_publish(b[0..n], t), 0);
+        test.assert_eq(t[codec.p_qos()], 1);
+        test.assert_eq(t[codec.p_retain()], 1);
+        test.assert_eq(t[codec.p_pid()], 5);
+        test.assert_eq(t[codec.p_payload()], 7);
+        test.assert_eq(t[codec.p_payload_len()], 1);
+        // An empty payload is fine.
+        n = unhex(b, "300400026162");
+        test.assert_eq(codec.decode_publish(b[0..n], t), 0);
+        test.assert_eq(t[codec.p_payload_len()], 0);
+        // QoS 2 is this client's own refusal; QoS 3 is malformed.
+        n = unhex(b, "3406000174000578");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_qos2());
+        n = unhex(b, "3606000174000578");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_malformed());
+        // DUP on a QoS 0 message.
+        n = unhex(b, "380400026162");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_malformed());
+        // A wildcard in a topic name from a broker, and an empty topic.
+        n = unhex(b, "300400022378");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_topic());
+        n = unhex(b, "30020000");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_topic());
+        // Packet id 0 on QoS 1.
+        n = unhex(b, "3206000174000078");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_packet_id());
+        // A topic longer than the packet, and a QoS 1 packet with no room for the id.
+        n = unhex(b, "300400096162");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "3203000174");
+        test.assert_eq(codec.decode_publish(b[0..n], t), codec.e_malformed());
+    }
+    return 0;
+}
+
+pub fn test_acks() -> [] int {
+    region a {
+        let b = alloc_slice[a](32, byte_of(0));
+        let t = alloc_slice[a](codec.suback_slots(), 0);
+        // PUBACK and UNSUBACK carry a packet id.
+        var n = unhex(b, "40020102");
+        test.assert_eq(codec.decode_pid(b[0..n]), 258);
+        n = unhex(b, "B0020001");
+        test.assert_eq(codec.decode_pid(b[0..n]), 1);
+        n = unhex(b, "40020000");
+        test.assert_eq(codec.decode_pid(b[0..n]), codec.e_packet_id());
+        n = unhex(b, "400101");
+        test.assert_eq(codec.decode_pid(b[0..n]), codec.e_malformed());
+        // PINGRESP.
+        n = unhex(b, "D000");
+        test.assert_eq(codec.decode_empty(b[0..n]), 0);
+        n = unhex(b, "D00100");
+        test.assert_eq(codec.decode_empty(b[0..n]), codec.e_malformed());
+        // SUBACK for four filters: granted 0, 0, 1, and a failure.
+        n = unhex(b, "9006000700000180");
+        test.assert_eq(codec.decode_suback(b[0..n], t), 0);
+        test.assert_eq(t[0], 7);
+        test.assert_eq(t[1], 4);
+        test.assert_eq(t[2], 0);
+        test.assert_eq(t[3], 0);
+        test.assert_eq(t[4], 1);
+        test.assert_eq(t[5], 128);
+        // A reserved return code, no codes, a packet id of 0.
+        n = unhex(b, "9003000703");
+        test.assert_eq(codec.decode_suback(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "90020007");
+        test.assert_eq(codec.decode_suback(b[0..n], t), codec.e_malformed());
+        n = unhex(b, "9003000000");
+        test.assert_eq(codec.decode_suback(b[0..n], t), codec.e_packet_id());
+    }
+    return 0;
+}
+
+pub fn test_filters_and_names() -> [] int {
+    test.assert(codec.valid_filter("a/b"));
+    test.assert(codec.valid_filter("a/+/c"));
+    test.assert(codec.valid_filter("#"));
+    test.assert(codec.valid_filter("a/#"));
+    test.assert(codec.valid_filter("+"));
+    test.assert(codec.valid_filter("/"));
+    test.assert(!codec.valid_filter(""));
+    test.assert(!codec.valid_filter("a/#/b"));
+    test.assert(!codec.valid_filter("a#"));
+    test.assert(!codec.valid_filter("a+"));
+    test.assert(!codec.valid_filter("a/+b"));
+    test.assert(!codec.valid_filter("#/a"));
+    test.assert(codec.valid_name("a/b"));
+    test.assert(codec.valid_name("$SYS/x"));
+    test.assert(!codec.valid_name(""));
+    test.assert(!codec.valid_name("a/+"));
+    test.assert(!codec.valid_name("a/#"));
+    return 0;
+}
+
+pub fn test_encoders() -> [] int {
+    region a {
+        let b = alloc_slice[a](96, byte_of(0));
+        let f = alloc_slice[a](8, byte_of(0));
+        let t = alloc_slice[a](3 * codec.max_filters() + 3, 0);
+        // CONNECT: client id c, keep-alive 60, clean, nothing else.
+        var n = codec.put_connect(b, 0, "c", 60, true, "", "", "", "", 0, 0);
+        test.assert(matches(b, n, "100D00044D5154540402003C000163"));
+        // CONNECT with a user, a password and a will (QoS 1, retain), no clean session.
+        n = codec.put_connect(b, 0, "id", 10, false, "u", "p", "w/t", "bye", 1, 1);
+        test.assert(matches(b, n, "101E00044D51545404EC000A000269640003772F740003627965000175000170"));
+        // An empty client id is fine with a clean session.
+        n = codec.put_connect(b, 0, "", 0, true, "", "", "", "", 0, 0);
+        test.assert(matches(b, n, "100C00044D515454040200000000"));
+        // PUBLISH at QoS 0, then QoS 1 with retain, then QoS 1 with DUP.
+        n = codec.put_publish(b, 0, "a/b", "hi", 0, 0, 0, 0);
+        test.assert(matches(b, n, "30070003612F626869"));
+        n = codec.put_publish(b, 0, "t", "x", 1, 1, 0, 5);
+        test.assert(matches(b, n, "3306000174000578"));
+        n = codec.put_publish(b, 0, "t", "x", 1, 0, 1, 5);
+        test.assert(matches(b, n, "3A06000174000578"));
+        // SUBSCRIBE of one and of two filters, UNSUBSCRIBE of one.
+        unhex(f, "612F23622F2B");
+        t[0] = 0;
+        t[1] = 3;
+        t[2] = 1;
+        n = codec.put_subscribe(b, 0, 1, f, t, 1);
+        test.assert(matches(b, n, "820800010003612F2301"));
+        t[3] = 3;
+        t[4] = 3;
+        t[5] = 0;
+        t[2] = 0;
+        t[0] = 0;
+        n = codec.put_subscribe(b, 0, 1, f, t, 2);
+        test.assert(matches(b, n, "820E00010003612F23000003622F2B00"));
+        t[5] = 1;
+        n = codec.put_subscribe(b, 0, 1, f, t, 2);
+        test.assert(matches(b, n, "820E00010003612F23000003622F2B01"));
+        n = codec.put_unsubscribe(b, 0, 2, f, t, 1);
+        test.assert(matches(b, n, "A20700020003612F23"));
+        // PUBACK, PINGREQ, DISCONNECT.
+        n = codec.put_puback(b, 0, 258);
+        test.assert(matches(b, n, "40020102"));
+        n = codec.put_pingreq(b, 0);
+        test.assert(matches(b, n, "C000"));
+        n = codec.put_disconnect(b, 2);
+        test.assert(n == 4);
+        test.assert(matches(b[2..4], 2, "E000"));
+    }
+    return 0;
+}
+
+// A packet that exactly fills its slice: the size of the length field is the difference (127 takes one byte, 128 two).
+pub fn test_exact_fit_at_the_length_edges() -> [] int {
+    region a {
+        let payload = alloc_slice[a](130, byte_of(120));
+        let exact127 = alloc_slice[a](129, byte_of(0));
+        let n = codec.put_publish(exact127, 0, "t", payload[0..124], 0, 0, 0, 0);
+        test.assert_eq(n, 129);
+        test.assert_eq(int_of(exact127[1]), 127);
+        let exact128 = alloc_slice[a](131, byte_of(0));
+        let m = codec.put_publish(exact128, 0, "t", payload[0..125], 0, 0, 0, 0);
+        test.assert_eq(m, 131);
+        test.assert_eq(int_of(exact128[1]), 128);
+        test.assert_eq(int_of(exact128[2]), 1);
+        test.assert_eq(codec.publish_size(1, 124, 0), 129);
+        test.assert_eq(codec.publish_size(1, 125, 0), 131);
+        // One byte short is no room, not a trap.
+        let short = alloc_slice[a](128, byte_of(0));
+        test.assert_eq(codec.put_publish(short, 0, "t", payload[0..124], 0, 0, 0, 0), codec.no_room());
+    }
+    return 0;
+}
+
+pub fn test_encoder_refusals() -> [] int {
+    region a {
+        let b = alloc_slice[a](64, byte_of(0));
+        let tiny = alloc_slice[a](5, byte_of(0));
+        let f = alloc_slice[a](8, byte_of(0));
+        let t = alloc_slice[a](3 * codec.max_filters() + 3, 0);
+        // PUBLISH: QoS 2, QoS 3, a wildcard in the name, an empty name, QoS 1 with no packet id, DUP on QoS 0, and no room.
+        test.assert_eq(codec.put_publish(b, 0, "a", "x", 2, 0, 0, 1), codec.e_qos2());
+        test.assert_eq(codec.put_publish(b, 0, "a", "x", 3, 0, 0, 1), codec.e_argument());
+        test.assert_eq(codec.put_publish(b, 0, "a/+", "x", 0, 0, 0, 0), codec.e_topic());
+        test.assert_eq(codec.put_publish(b, 0, "", "x", 0, 0, 0, 0), codec.e_topic());
+        test.assert_eq(codec.put_publish(b, 0, "a", "x", 1, 0, 0, 0), codec.e_packet_id());
+        test.assert_eq(codec.put_publish(b, 0, "a", "x", 1, 0, 0, 65536), codec.e_packet_id());
+        test.assert_eq(codec.put_publish(b, 0, "a", "x", 0, 0, 1, 0), codec.e_argument());
+        test.assert_eq(codec.put_publish(tiny, 0, "a/b/c", "payload", 0, 0, 0, 0), codec.no_room());
+        test.assert_eq(codec.put_publish(b, 0 - 1, "a", "x", 0, 0, 0, 0), codec.no_room());
+        // CONNECT: a password with no user, an empty id without a clean session, a will QoS 2, a will message with no will topic,
+        // a keep-alive out of range, a will topic with a wildcard.
+        test.assert_eq(codec.put_connect(b, 0, "c", 60, true, "", "p", "", "", 0, 0), codec.e_argument());
+        test.assert_eq(codec.put_connect(b, 0, "", 60, false, "", "", "", "", 0, 0), codec.e_argument());
+        test.assert_eq(codec.put_connect(b, 0, "c", 60, true, "", "", "w", "m", 2, 0), codec.e_qos2());
+        test.assert_eq(codec.put_connect(b, 0, "c", 60, true, "", "", "", "m", 0, 0), codec.e_argument());
+        test.assert_eq(codec.put_connect(b, 0, "c", 70000, true, "", "", "", "", 0, 0), codec.e_argument());
+        test.assert_eq(codec.put_connect(b, 0, "c", 60, true, "", "", "w/#", "m", 0, 0), codec.e_topic());
+        test.assert_eq(codec.put_connect(tiny, 0, "client", 60, true, "", "", "", "", 0, 0), codec.no_room());
+        // SUBSCRIBE: QoS 2, an invalid filter, no filters, too many, a packet id of 0.
+        unhex(f, "612F23");
+        t[0] = 0;
+        t[1] = 3;
+        t[2] = 2;
+        test.assert_eq(codec.put_subscribe(b, 0, 1, f, t, 1), codec.e_qos2());
+        t[2] = 1;
+        test.assert_eq(codec.put_subscribe(b, 0, 0, f, t, 1), codec.e_packet_id());
+        test.assert_eq(codec.put_subscribe(b, 0, 1, f, t, 0), codec.e_filters());
+        test.assert_eq(codec.put_subscribe(b, 0, 1, f, t, 17), codec.e_filters());
+        // A filter that is not valid ("a#"), and one that runs past the data.
+        unhex(f, "6123");
+        t[1] = 2;
+        test.assert_eq(codec.put_subscribe(b, 0, 1, f, t, 1), codec.e_topic());
+        t[1] = 3;
+        t[0] = 6;
+        test.assert_eq(codec.put_subscribe(b, 0, 1, f, t, 1), codec.e_topic());
+        t[0] = 0;
+        test.assert_eq(codec.put_puback(b, 0, 0), codec.e_packet_id());
+        test.assert_eq(codec.put_pingreq(tiny, 4), codec.no_room());
+    }
+    return 0;
+}
+
+// ---- no input reaches a trap ------------------------------------------------
+
+// The next number of a small linear congruential generator.
+fn next(seed: int) -> [] int {
+    return (seed * 1103515245 + 12345) % 2147483648;
+}
+
+// Run every decoder on `whole`, which is any bytes at all.
+fn probe[&w, &c, &p, &s](whole: &w [byte], ct: &!c [int], pt: &!p [int], st: &!s [int]) -> [] int {
+    let total = codec.header(whole, 70000);
+    if total > 0 && total <= len(whole) {
+        let one = whole[0..total];
+        codec.check_kind(codec.kind(one), codec.flags(one));
+        codec.decode_connack(one, ct);
+        codec.decode_publish(one, pt);
+        codec.decode_suback(one, st);
+        codec.decode_pid(one);
+        codec.decode_empty(one);
+    }
+    codec.decode_connack(whole, ct);
+    codec.decode_publish(whole, pt);
+    codec.decode_suback(whole, st);
+    codec.decode_pid(whole);
+    codec.decode_empty(whole);
+    return 0;
+}
+
+// The valid packets the sweeps start from.
+fn corpus(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "20020100";
+    }
+    if i == 1 {
+        return "30070003612F626869";
+    }
+    if i == 2 {
+        return "3306000174000578";
+    }
+    if i == 3 {
+        return "9006000700000180";
+    }
+    if i == 4 {
+        return "40020102";
+    }
+    if i == 5 {
+        return "B0020001";
+    }
+    if i == 6 {
+        return "D000";
+    }
+    return "3A06000174000578";
+}
+
+pub fn test_no_input_reaches_a_trap() -> [] int {
+    region a {
+        let buf = alloc_slice[a](96, byte_of(0));
+        let work = alloc_slice[a](96, byte_of(0));
+        let ct = alloc_slice[a](codec.connack_slots(), 0);
+        let pt = alloc_slice[a](codec.publish_slots(), 0);
+        let st = alloc_slice[a](codec.suback_slots(), 0);
+        // Every prefix, every one-byte deletion and every one-byte change of each valid packet.
+        var c = 0;
+        while c < 8 {
+            let n = unhex(buf, corpus(c));
+            var cut = 0;
+            while cut <= n {
+                probe(buf[0..cut], ct, pt, st);
+                cut = cut + 1;
+            }
+            var del = 0;
+            while del < n {
+                var i = 0;
+                var j = 0;
+                while i < n {
+                    if i != del {
+                        work[j] = buf[i];
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+                probe(work[0..j], ct, pt, st);
+                del = del + 1;
+            }
+            var pos = 0;
+            while pos < n {
+                var v = 0;
+                while v < 256 {
+                    var i = 0;
+                    while i < n {
+                        work[i] = buf[i];
+                        i = i + 1;
+                    }
+                    work[pos] = byte_of(v);
+                    probe(work[0..n], ct, pt, st);
+                    v = v + 17;
+                }
+                pos = pos + 1;
+            }
+            c = c + 1;
+        }
+        // Random bytes, biased to small values so lengths are often plausible.
+        var seed = 12345;
+        var round = 0;
+        while round < 4000 {
+            var i = 0;
+            while i < len(buf) {
+                seed = next(seed);
+                if seed / 65536 % 3 == 0 {
+                    buf[i] = byte_of(seed / 256 % 256);
+                } else {
+                    buf[i] = byte_of(seed / 256 % 24);
+                }
+                i = i + 1;
+            }
+            seed = next(seed);
+            let n = 2 + seed / 256 % (len(buf) - 1);
+            probe(buf[0..n], ct, pt, st);
+            round = round + 1;
+        }
+    }
+    return 0;
+}
+
+pub fn test_encoders_never_trap() -> [] int {
+    region a {
+        let out = alloc_slice[a](48, byte_of(0));
+        let f = alloc_slice[a](16, byte_of(65));
+        let t = alloc_slice[a](3 * codec.max_filters(), 0);
+        var seed = 99;
+        var round = 0;
+        while round < 3000 {
+            seed = next(seed);
+            let at = seed / 256 % 60 - 6;
+            seed = next(seed);
+            let qos = seed / 256 % 5 - 1;
+            seed = next(seed);
+            let pid = seed / 256 % 70000 - 2;
+            seed = next(seed);
+            let l = seed / 256 % 20;
+            seed = next(seed);
+            let ka = seed / 256 % 80000 - 5;
+            codec.put_publish(out, at, f[0..l % 17], f[0..l % 11], qos, qos & 1, qos & 1, pid);
+            codec.put_connect(out, at, f[0..l % 9], ka, qos > 0, f[0..l % 4], f[0..l % 3], f[0..l % 7], f[0..l % 5], qos, qos & 1);
+            codec.put_puback(out, at, pid);
+            codec.put_pingreq(out, at);
+            codec.put_disconnect(out, at);
+            t[0] = l % 10 - 2;
+            t[1] = l % 13 - 3;
+            t[2] = qos;
+            codec.put_subscribe(out, at, pid, f, t, l % 20 - 1);
+            codec.put_unsubscribe(out, at, pid, f, t, l % 20 - 1);
+            round = round + 1;
+        }
+    }
+    return 0;
+}
