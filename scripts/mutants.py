@@ -100,6 +100,9 @@ def main():
     survivors = []
     base_client = (ROOT / "src" / "client.cho").read_text()
     everything = [(n, w, o, nw, False) for n, (w, o, nw) in MUTANTS.items()] + [(n, w, o, nw, True) for n, (w, o, nw) in CLIENT_MUTANTS.items()]
+    if "--after" in sys.argv:
+        names = [e[0] for e in everything]
+        everything = everything[names.index(sys.argv[sys.argv.index("--after") + 1]) + 1:]
     for name, what, old, new, in_client in everything:
         text = base_client if in_client else base
         if text.count(old) != 1:
