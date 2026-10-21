@@ -12,6 +12,7 @@ edition 5;
 module mqttc.client;
 
 import std.buffer;
+import std.vec;
 import mqttc.codec;
 
 // ---- states --------------------------------------------------------------
@@ -61,7 +62,7 @@ pub fn ev_unsubscribed() -> [] int {
     return 5;
 }
 
-// `a`: the packet id of a PUBACK (QoS 1 publishing is slice 3; the event exists so a broker's stray PUBACK is visible).
+// `a`: the packet id of a PUBACK; `b`: 1 if it freed a held QoS 1 message, 0 if it named nothing held (a stray one, ignored).
 pub fn ev_acked() -> [] int {
     return 6;
 }
@@ -72,6 +73,97 @@ pub fn ev_refused() -> [] int {
 }
 
 // ---- the machine ---------------------------------------------------------
+
+// ---- the messages held until they are acknowledged ----------------------------------------------
+
+// The most bytes of unacknowledged QoS 1 packets the machine keeps (design section 5, `client.queue-full`).
+pub fn max_held_bytes() -> [] int {
+    return 65536;
+}
+
+// The default number of QoS 1 messages in flight at once (design section 5, `client.window-full`).
+pub fn default_window() -> [] int {
+    return 16;
+}
+
+res struct Held {
+    // The packets as they were written (DUP clear), back to back.
+    packets: buffer.Buffer,
+    // Three ints per packet: its packet id, where it starts in `packets`, how long it is.
+    index: vec.Vec[int],
+    window: int,
+}
+
+fn held_new[&h](heap: &!h Heap) -> [heap] Held {
+    return Held { packets: buffer.empty(heap, 128), index: vec.empty(heap, 12, 0), window: default_window() };
+}
+
+fn held_count[&x](h: &x Held) -> [] int {
+    return vec.size(h.index) / 3;
+}
+
+fn held_has[&x](h: &x Held, pid: int) -> [] bool {
+    var i = 0;
+    while i < vec.size(h.index) {
+        if vec.get(h.index, i) == pid {
+            return true;
+        }
+        i = i + 3;
+    }
+    return false;
+}
+
+fn held_add[&h, &p](heap: &!h Heap, held: Held, pid: int, packet: &p [byte]) -> [heap] Held {
+    let Held { packets, index, window } = held;
+    var at = 0;
+    borrow packets as &pr in {
+        at = buffer.size(pr);
+    }
+    var idx = vec.push(heap, index, pid);
+    idx = vec.push(heap, idx, at);
+    idx = vec.push(heap, idx, len(packet));
+    return Held { packets: buffer.append(heap, packets, packet), index: idx, window: window };
+}
+
+// Forget the packet with id `pid`; answers the rest and whether it was there. The bytes are copied, so what stays is contiguous.
+fn held_remove[&h](heap: &!h Heap, held: Held, pid: int) -> [heap] (Held, bool) {
+    let Held { packets, index, window } = held;
+    var found = false;
+    var keep_packets = buffer.empty(heap, 128);
+    var keep_index = vec.empty(heap, 12, 0);
+    var next_at = 0;
+    borrow packets as &pr in {
+        borrow index as &ir in {
+            let all = buffer.bytes(pr);
+            var i = 0;
+            while i < vec.size(ir) {
+                let id = vec.get(ir, i);
+                let from = vec.get(ir, i + 1);
+                let n = vec.get(ir, i + 2);
+                if id == pid {
+                    found = true;
+                } else {
+                    keep_index = vec.push(heap, keep_index, id);
+                    keep_index = vec.push(heap, keep_index, next_at);
+                    keep_index = vec.push(heap, keep_index, n);
+                    next_at = next_at + n;
+                    keep_packets = buffer.append(heap, keep_packets, all[from..from + n]);
+                }
+                i = i + 3;
+            }
+        }
+    }
+    buffer.drop(heap, packets);
+    vec.drop(heap, index);
+    return (Held { packets: keep_packets, index: keep_index, window: window }, found);
+}
+
+fn held_clear[&h](heap: &!h Heap, held: Held) -> [heap] Held {
+    let Held { packets, index, window } = held;
+    buffer.drop(heap, packets);
+    vec.drop(heap, index);
+    return Held { packets: buffer.empty(heap, 128), index: vec.empty(heap, 12, 0), window: window };
+}
 
 pub res struct Client {
     // Bytes read and not yet a whole packet.
@@ -85,6 +177,8 @@ pub res struct Client {
     // When a PINGREQ was sent and nothing has been heard since; -1 when none is outstanding.
     ping_sent: int,
     next_pid: int,
+    // The QoS 1 messages sent and not yet acknowledged.
+    held: Held,
 }
 
 pub fn new[&h](heap: &!h Heap, max_packet: int) -> [heap] Client {
@@ -92,13 +186,16 @@ pub fn new[&h](heap: &!h Heap, max_packet: int) -> [heap] Client {
     if bound < 64 {
         bound = 64;
     }
-    return Client { rx: buffer.empty(heap, 256), inbox: buffer.empty(heap, 256), state: 0, keepalive_ms: 0, max_packet: bound, last_sent: 0, ping_sent: 0 - 1, next_pid: 1 };
+    return Client { rx: buffer.empty(heap, 256), inbox: buffer.empty(heap, 256), state: 0, keepalive_ms: 0, max_packet: bound, last_sent: 0, ping_sent: 0 - 1, next_pid: 1, held: held_new(heap) };
 }
 
 pub fn drop[&h](heap: &!h Heap, c: Client) -> [heap] int {
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     buffer.drop(heap, rx);
     buffer.drop(heap, inbox);
+    let Held { packets, index, window } = held;
+    buffer.drop(heap, packets);
+    vec.drop(heap, index);
     return state;
 }
 
@@ -146,52 +243,151 @@ pub fn open[&h, &i, &u, &w, &t, &m](heap: &!h Heap, c: Client, out: buffer.Buffe
     if st0 != 0 {
         return (c, out, codec.e_state());
     }
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     let size = 11 + 2 * 5 + len(client_id) + len(user) + len(pass) + len(will_topic) + len(will_message) + 16;
     region a {
         let packet = alloc_slice[a](size, byte_of(0));
         let n = codec.put_connect(packet, 0, client_id, keepalive, clean_session, user, pass, will_topic, will_message, will_qos, will_retain);
         if n < 0 {
-            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, n);
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, n);
         }
         let written = append_packet(heap, out, packet[0..n]);
-        return (Client { rx: rx, inbox: inbox, state: 1, keepalive_ms: keepalive * 1000, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid }, written, 0);
+        // A clean session starts with nothing held (3.1.2.4); a kept one keeps what was not acknowledged.
+        var kept = held;
+        if clean_session {
+            kept = held_clear(heap, kept);
+        }
+        return (Client { rx: rx, inbox: inbox, state: 1, keepalive_ms: keepalive * 1000, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid, held: kept }, written, 0);
     }
 }
 
-// PUBLISH at QoS 0 (QoS 1 publishing, with its window and retries, is slice 3: `qos` 1 is `e_argument` until then). Answers the machine,
-// `out`, and 0 or a refusal code (`e_state` when not connected).
+// The next packet id at or after `from` that no held message uses (a packet id must be unused among everything in flight, 2.3.1).
+fn fresh[&x](c: &x Client, from: int) -> [] int {
+    var pid = from;
+    var tries = 0;
+    while held_has(c.held, pid) && tries <= 300 {
+        pid = bump(pid);
+        tries = tries + 1;
+    }
+    return pid;
+}
+
+// PUBLISH at QoS 0 or 1. QoS 0 is written and forgotten; answers 0. QoS 1 is written and held until its PUBACK; answers its packet id (1 to
+// 65535). A refusal is negative: `e_state` when not connected, `e_qos2` for QoS 2, `e_argument` for another QoS, the codec's for a bad
+// topic, `e_window` when the window is full, `e_queue_full` when the held bytes would pass `max_held_bytes`.
 pub fn publish[&h, &t, &p](heap: &!h Heap, c: Client, out: buffer.Buffer, topic: &t [byte], payload: &p [byte], qos: int, retain: int, now: int) -> [heap] (Client, buffer.Buffer, int) {
     var st0 = 0;
     var mp0 = 0;
-    var ka0 = 0;
     var pid0 = 1;
+    var held_n = 0;
+    var held_b = 0;
+    var win = 0;
     borrow c as &cr0 in {
         st0 = cr0.state;
         mp0 = cr0.max_packet;
-        ka0 = cr0.keepalive_ms;
-        pid0 = cr0.next_pid;
+        pid0 = fresh(cr0, cr0.next_pid);
+        held_n = held_count(cr0.held);
+        held_b = buffer.size(cr0.held.packets);
+        win = cr0.held.window;
     }
     if st0 != 2 {
         return (c, out, codec.e_state());
     }
-    if qos != 0 {
+    if qos == 2 {
+        return (c, out, codec.e_qos2());
+    }
+    if qos < 0 || qos > 1 {
         return (c, out, codec.e_argument());
     }
-    let size = codec.publish_size(len(topic), len(payload), 0);
+    let size = codec.publish_size(len(topic), len(payload), qos);
     if size > mp0 {
         return (c, out, 0 - 3);
     }
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    if qos == 1 && held_n >= win {
+        return (c, out, codec.e_window());
+    }
+    if qos == 1 && held_b + size > max_held_bytes() {
+        return (c, out, codec.e_queue_full());
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     region a {
         let packet = alloc_slice[a](size, byte_of(0));
-        let n = codec.put_publish(packet, 0, topic, payload, 0, retain, 0, 0);
+        var pid = 0;
+        if qos == 1 {
+            pid = pid0;
+        }
+        let n = codec.put_publish(packet, 0, topic, payload, qos, retain, 0, pid);
         if n < 0 {
-            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, n);
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, n);
         }
         let written = append_packet(heap, out, packet[0..n]);
-        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: next_pid }, written, 0);
+        var hd = held;
+        var np = next_pid;
+        if qos == 1 {
+            hd = held_add(heap, hd, pid, packet[0..n]);
+            np = bump(pid);
+        }
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: np, held: hd }, written, pid);
     }
+}
+
+// How many QoS 1 messages have been sent and not yet acknowledged.
+pub fn inflight[&c](c: &c Client) -> [] int {
+    return held_count(c.held);
+}
+
+// The window: how many QoS 1 messages may be in flight at once (1 to 256; the default is `default_window()`).
+pub fn set_window(c: Client, n: int) -> [] Client {
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
+    let Held { packets, index, window } = held;
+    var w = n;
+    if w < 1 {
+        w = 1;
+    }
+    if w > 256 {
+        w = 256;
+    }
+    return Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: Held { packets: packets, index: index, window: w } };
+}
+
+// Write every held message again to `out`, DUP set (3.3.1.1), in the order they were first sent. MQTT allows this only after the connection was
+// re-established with a kept session (4.4); the caller calls it then, once the machine is connected again. Answers the machine, `out`, and how
+// many were written, or `e_state` when not connected.
+pub fn resend[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+    }
+    if st0 != 2 {
+        return (c, out, codec.e_state());
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
+    let Held { packets, index, window } = held;
+    var answer = out;
+    var count = 0;
+    borrow packets as &pr in {
+        borrow index as &ir in {
+            let all = buffer.bytes(pr);
+            var i = 0;
+            while i < vec.size(ir) {
+                let from = vec.get(ir, i + 1);
+                let n = vec.get(ir, i + 2);
+                region a {
+                    let again = alloc_slice[a](n, byte_of(0));
+                    copy_into(again, all[from..from + n]);
+                    again[0] = byte_of(int_of(again[0]) | 8);
+                    answer = append_packet(heap, answer, again);
+                }
+                count = count + 1;
+                i = i + 3;
+            }
+        }
+    }
+    var sent = last_sent;
+    if count > 0 {
+        sent = now;
+    }
+    return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: sent, ping_sent: ping_sent, next_pid: next_pid, held: Held { packets: packets, index: index, window: window } }, answer, count);
 }
 
 // SUBSCRIBE (`with_qos`) or UNSUBSCRIBE for the `n` filters `table` describes (see `codec.put_subscribe`). Answers the machine, `out`, and the
@@ -205,7 +401,7 @@ fn filters[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [
         st0 = cr0.state;
         mp0 = cr0.max_packet;
         ka0 = cr0.keepalive_ms;
-        pid0 = cr0.next_pid;
+        pid0 = fresh(cr0, cr0.next_pid);
     }
     if st0 != 2 {
         return (c, out, codec.e_state());
@@ -220,7 +416,7 @@ fn filters[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [
         return (c, out, 0 - 3);
     }
     let pid = pid0;
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     region a {
         let packet = alloc_slice[a](size + 8, byte_of(0));
         var written = 0 - 1;
@@ -230,10 +426,10 @@ fn filters[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [
             written = codec.put_unsubscribe(packet, 0, pid, data, table, n);
         }
         if written < 0 {
-            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, written);
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, written);
         }
         let appended = append_packet(heap, out, packet[0..written]);
-        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: bump(next_pid) }, appended, pid);
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: bump(next_pid), held: held }, appended, pid);
     }
 }
 
@@ -260,12 +456,12 @@ pub fn disconnect[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -
     if st0 != 2 {
         return (c, out, codec.e_state());
     }
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     region a {
         let packet = alloc_slice[a](2, byte_of(0));
         let n = codec.put_disconnect(packet, 0);
         let written = append_packet(heap, out, packet[0..n]);
-        return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid }, written, 0);
+        return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid, held: held }, written, 0);
     }
 }
 
@@ -301,13 +497,13 @@ pub fn tick[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -> [hea
     if st0 != 2 || ka0 == 0 {
         return (c, out, idle_ms());
     }
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     if ping_sent >= 0 {
         let due = ping_sent + grace(keepalive_ms);
         if now >= due {
-            return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1, next_pid: next_pid }, out, codec.e_keepalive());
+            return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1, next_pid: next_pid, held: held }, out, codec.e_keepalive());
         }
-        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, due - now);
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, due - now);
     }
     let due = last_sent + keepalive_ms;
     if now >= due {
@@ -315,10 +511,10 @@ pub fn tick[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -> [hea
             let packet = alloc_slice[a](2, byte_of(0));
             let n = codec.put_pingreq(packet, 0);
             let written = append_packet(heap, out, packet[0..n]);
-            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: now, next_pid: next_pid }, written, grace(keepalive_ms));
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: now, next_pid: next_pid, held: held }, written, grace(keepalive_ms));
         }
     }
-    return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, due - now);
+    return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, due - now);
 }
 
 // ---- reading -------------------------------------------------------------
@@ -340,13 +536,14 @@ fn emit[&e](events: &!e [int], at: int, kind: int, a: int, b: int, c: int, d: in
 // used up, the rest stays inside the machine: call `feed` again with no bytes to continue. A broker packet that breaks a rule is an
 // `ev_refused` event and the machine is closed; bytes after it are dropped.
 pub fn feed[&h, &d, &e](heap: &!h Heap, c: Client, data: &d [byte], now: int, events: &!e [int], out: buffer.Buffer) -> [heap] (Client, buffer.Buffer, int) {
-    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
     // A closed machine takes no input: what the caller sent is dropped.
     var received = rx;
     if state != 0 {
         received = buffer.append(heap, received, data);
     }
     var box = inbox;
+    var hd = held;
     var answer = out;
     var st = state;
     var ping = ping_sent;
@@ -408,6 +605,10 @@ pub fn feed[&h, &d, &e](heap: &!h Heap, c: Client, data: &d [byte], now: int, ev
                                     } else {
                                         ne = emit(events, ne, ev_connected(), contents(cw)[0], 0, 0, 0, 0);
                                         st = 2;
+                                        // The broker has no session of ours: whatever was held can never be acknowledged (3.2.2.2).
+                                        if contents(cw)[0] == 0 {
+                                            hd = held_clear(heap, hd);
+                                        }
                                     }
                                 } else if k == 3 {
                                     let rc = codec.decode_publish(packet, contents(pw));
@@ -451,7 +652,14 @@ pub fn feed[&h, &d, &e](heap: &!h Heap, c: Client, data: &d [byte], now: int, ev
                                     } else if k == 11 {
                                         ne = emit(events, ne, ev_unsubscribed(), pid, 0, 0, 0, 0);
                                     } else {
-                                        ne = emit(events, ne, ev_acked(), pid, 0, 0, 0, 0);
+                                        // A PUBACK frees the held message it names; one that names nothing held is reported (b = 0) and ignored.
+                                        let (h2, was) = held_remove(heap, hd, pid);
+                                        hd = h2;
+                                        var matched = 0;
+                                        if was {
+                                            matched = 1;
+                                        }
+                                        ne = emit(events, ne, ev_acked(), pid, matched, 0, 0, 0);
                                     }
                                 } else {
                                     // PINGRESP (13): nothing to report; `ping` is already clear.
@@ -485,5 +693,5 @@ pub fn feed[&h, &d, &e](heap: &!h Heap, c: Client, data: &d [byte], now: int, ev
     unbox_slice(heap, pt);
     unbox_slice(heap, sbt);
     unbox_slice(heap, cat);
-    return (Client { rx: kept, inbox: box, state: st, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: sent, ping_sent: ping, next_pid: next_pid }, answer, ne);
+    return (Client { rx: kept, inbox: box, state: st, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: sent, ping_sent: ping, next_pid: next_pid, held: hd }, answer, ne);
 }

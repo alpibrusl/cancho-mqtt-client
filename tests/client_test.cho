@@ -190,6 +190,56 @@ fn do_tick[&h](heap: &!h Heap, r: Rig, now: int, want: int) -> [heap] Rig {
     return Rig { c: c1, out: o1, log: log };
 }
 
+// Open with a chosen clean-session flag.
+fn do_open_session[&h](heap: &!h Heap, r: Rig, keepalive: int, clean: bool, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.open(heap, c, out, "c", keepalive, clean, "", "", "", "", 0, 0, now);
+    expect(rc, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+fn do_disconnect[&h](heap: &!h Heap, r: Rig, now: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.disconnect(heap, c, out, now);
+    test.assert_eq(rc, 0);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+fn check_inflight(r: Rig, want: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    borrow c as &cr in {
+        test.assert_eq(client.inflight(cr), want);
+    }
+    return Rig { c: c, out: out, log: log };
+}
+
+fn do_window(r: Rig, n: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    return Rig { c: client.set_window(c, n), out: out, log: log };
+}
+
+fn do_resend[&h](heap: &!h Heap, r: Rig, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, n) = client.resend(heap, c, out, now);
+    test.assert_eq(n, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+// A QoS `qos` publish of a payload of `n` bytes.
+fn do_publish_big[&h](heap: &!h Heap, r: Rig, n: int, qos: int, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    var cc = c;
+    var oo = out;
+    region a {
+        let payload = alloc_slice[a](n, byte_of(120));
+        let (c1, o1, rc) = client.publish(heap, cc, oo, "a/b", payload, qos, 0, now);
+        cc = c1;
+        oo = o1;
+        expect(rc, want);
+    }
+    return Rig { c: cc, out: oo, log: log };
+}
+
 fn do_publish[&h, &t, &p](heap: &!h Heap, r: Rig, topic: &t [byte], payload: &p [byte], qos: int, now: int, want: int) -> [heap] Rig {
     let Rig { c, out, log } = r;
     let (c1, o1, rc) = client.publish(heap, c, out, topic, payload, qos, 0, now);
@@ -292,10 +342,11 @@ pub fn test_nothing_before_connack[&h](heap: &!h Heap) -> [heap] int {
 
 pub fn test_publish_subscribe_unsubscribe[&h](heap: &!h Heap) -> [heap] int {
     var r = connected(heap, 60, 1024);
-    // PUBLISH at QoS 0: exact bytes. QoS 1 publishing is slice 3. A wildcard in the name is the codec's refusal.
+    // PUBLISH at QoS 0: exact bytes. QoS 3 is an argument error, QoS 2 is the client's own refusal, a wildcard in the name the codec's.
     r = do_publish(heap, r, "a/b", "hi", 0, 200, 0);
     r = check_wrote(r, "30070003612F626869");
-    r = do_publish(heap, r, "a/b", "hi", 1, 200, codec.e_argument());
+    r = do_publish(heap, r, "a/b", "hi", 3, 200, codec.e_argument());
+    r = do_publish(heap, r, "a/b", "hi", 2, 200, codec.e_qos2());
     r = do_publish(heap, r, "a/#", "hi", 0, 200, codec.e_topic());
     r = check_wrote(r, "");
     // SUBSCRIBE "a/#" at QoS 1: packet id 1; a second gets 2.
@@ -443,6 +494,139 @@ pub fn test_disconnect[&h](heap: &!h Heap) -> [heap] int {
     return 0;
 }
 
+pub fn test_qos1_publish_and_ack[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 60, 1024);
+    // QoS 1: the packet id comes back, the exact bytes go out, the message is held.
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, 1);
+    r = check_wrote(r, "32090003612F6200016869");
+    r = check_inflight(r, 1);
+    r = do_publish(heap, r, "a/b", "hi", 1, 210, 2);
+    r = check_wrote(r, "32090003612F6200026869");
+    r = check_inflight(r, 2);
+    // PUBACK 1 frees the first, and says so.
+    r = do_feed(heap, r, "40020001", 220, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_acked());
+    r = check_ev(r, 0, 1, 1);
+    r = check_ev(r, 0, 2, 1);
+    r = check_inflight(r, 1);
+    // The same PUBACK again names nothing held: reported (b = 0), ignored.
+    r = do_feed(heap, r, "40020001", 230, 4, 1);
+    r = check_ev(r, 1, 1, 1);
+    r = check_ev(r, 1, 2, 0);
+    r = check_inflight(r, 1);
+    r = do_feed(heap, r, "40020002", 240, 4, 1);
+    r = check_inflight(r, 0);
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_window_and_queue_bounds[&h](heap: &!h Heap) -> [heap] int {
+    // A window of two: the third waits for an ack, and then gets the next id.
+    var r = connected(heap, 60, 1024);
+    r = do_window(r, 2);
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, 1);
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, 2);
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, codec.e_window());
+    r = do_publish(heap, r, "a/b", "hi", 0, 200, 0);
+    r = check_inflight(r, 2);
+    r = do_feed(heap, r, "40020001", 210, 4, 1);
+    r = do_publish(heap, r, "a/b", "hi", 1, 220, 3);
+    rig_drop(heap, r);
+    // The held bytes are bounded: eight messages of 8,000 bytes fit under 65,536, the ninth does not.
+    var q = connected(heap, 60, 16384);
+    var i = 0;
+    while i < 8 {
+        q = do_publish_big(heap, q, 8000, 1, 300, i + 1);
+        i = i + 1;
+    }
+    q = do_publish_big(heap, q, 8000, 1, 300, codec.e_queue_full());
+    q = check_inflight(q, 8);
+    // QoS 0 is not held, so it is not bounded by it.
+    q = do_publish_big(heap, q, 8000, 0, 300, 0);
+    rig_drop(heap, q);
+    return 0;
+}
+
+pub fn test_resend_sets_dup_on_what_is_held[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 60, 1024);
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, 1);
+    r = do_publish(heap, r, "a/b", "hi", 1, 210, 2);
+    r = do_feed(heap, r, "40020001", 220, 4, 1);
+    r = wipe(r);
+    // Only the second is still held; it goes out again with DUP (0x32 -> 0x3A) and the same id.
+    r = do_resend(heap, r, 230, 1);
+    r = check_wrote(r, "3A090003612F6200026869");
+    // Nothing held, nothing to resend.
+    r = do_feed(heap, r, "40020002", 240, 4, 1);
+    r = do_resend(heap, r, 250, 0);
+    r = check_wrote(r, "");
+    rig_drop(heap, r);
+    // Not connected: refused.
+    var c = rig(heap, 1024);
+    c = do_resend(heap, c, 0, codec.e_state());
+    rig_drop(heap, c);
+    return 0;
+}
+
+pub fn test_sessions_decide_what_is_kept[&h](heap: &!h Heap) -> [heap] int {
+    // A clean session starts with nothing held.
+    var a = connected(heap, 60, 1024);
+    a = do_publish(heap, a, "a/b", "hi", 1, 200, 1);
+    a = do_disconnect(heap, a, 210);
+    a = do_open_session(heap, a, 60, true, 300, 0);
+    a = check_inflight(a, 0);
+    rig_drop(heap, a);
+    // A kept session, which the broker says it kept (session present): the message is still held, and goes out again.
+    var b = rig(heap, 1024);
+    b = do_open_session(heap, b, 60, false, 0, 0);
+    b = do_feed(heap, b, "20020100", 10, 4, 1);
+    b = do_publish(heap, b, "a/b", "hi", 1, 200, 1);
+    b = do_disconnect(heap, b, 210);
+    b = do_open_session(heap, b, 60, false, 300, 0);
+    b = do_feed(heap, b, "20020100", 310, 4, 1);
+    b = check_inflight(b, 1);
+    b = wipe(b);
+    b = do_resend(heap, b, 320, 1);
+    b = check_wrote(b, "3A090003612F6200016869");
+    rig_drop(heap, b);
+    // A kept session the broker does not have (session present 0): what was held can never be acknowledged, so it is dropped.
+    var c = rig(heap, 1024);
+    c = do_open_session(heap, c, 60, false, 0, 0);
+    c = do_feed(heap, c, "20020100", 10, 4, 1);
+    c = do_publish(heap, c, "a/b", "hi", 1, 200, 1);
+    c = do_disconnect(heap, c, 210);
+    c = do_open_session(heap, c, 60, false, 300, 0);
+    c = do_feed(heap, c, "20020000", 310, 4, 1);
+    c = check_inflight(c, 0);
+    rig_drop(heap, c);
+    return 0;
+}
+
+// Packet ids wrap at 65,535 and skip any id a held message still uses (2.3.1). One message stays unacknowledged under id 1; the other
+// 65,534 ids are used and acknowledged; the next publish would be 1 again, so it takes 2.
+pub fn test_packet_ids_skip_what_is_held[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 0, 1024);
+    r = do_publish(heap, r, "t", "x", 1, 100, 1);
+    var id = 2;
+    while id <= 65535 {
+        r = do_publish(heap, r, "t", "x", 1, 100, id);
+        region a {
+            let ack = alloc_slice[a](4, byte_of(0));
+            ack[0] = byte_of(64);
+            ack[1] = byte_of(2);
+            ack[2] = byte_of(id / 256);
+            ack[3] = byte_of(id % 256);
+            r = do_feed_raw(heap, r, ack, 100, 1, 1);
+        }
+        r = wipe(r);
+        id = id + 1;
+    }
+    r = check_inflight(r, 1);
+    r = do_publish(heap, r, "t", "x", 1, 100, 2);
+    rig_drop(heap, r);
+    return 0;
+}
+
 // ---- no input reaches a trap -------------------------------------------------------------------
 
 fn next(seed: int) -> [] int {
@@ -471,7 +655,13 @@ fn corpus(i: int) -> [] &static [byte] {
     if i == 6 {
         return "D000";
     }
-    return "3A06000174000578";
+    if i == 7 {
+        return "3A06000174000578";
+    }
+    if i == 8 {
+        return "40020001";
+    }
+    return "40020002";
 }
 
 pub fn test_no_input_reaches_a_trap[&h](heap: &!h Heap) -> [heap] int {
@@ -490,7 +680,7 @@ pub fn test_no_input_reaches_a_trap[&h](heap: &!h Heap) -> [heap] int {
             let now = round * 10 + step * 4000;
             if what == 0 {
                 // A valid packet of the corpus.
-                r = do_feed(heap, r, corpus(seed / 4096 % 8), now, 2, 0 - 1);
+                r = do_feed(heap, r, corpus(seed / 4096 % 10), now, 2, 0 - 1);
             } else if what == 1 {
                 // Random bytes in a random chunk.
                 region a {

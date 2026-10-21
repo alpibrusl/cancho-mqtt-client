@@ -2,7 +2,9 @@ edition 5;
 
 // `pub` -- connect to a broker, publish one message at QoS 0, disconnect.
 //
-//     pub <ipv4> <port> <topic> <payload> [<client-id>]
+//     pub <ipv4> <port> <topic> <payload> [<client-id> [<qos>]]
+//
+// With <qos> 1 it waits for the broker's PUBACK before it disconnects; QoS 0 is written and forgotten.
 //
 // Exit status: 0 published; 2 wrong arguments; 3 the broker refused the connection or sent something the client refused; 4 could not
 // connect; 5 the connection failed. The example of `docs/design.md` section 11, slice 2; it is a program, so its authority row is its own:
@@ -31,7 +33,7 @@ fn number_of[&t](text: &t [byte]) -> [] int {
     return n;
 }
 
-fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], payload: &p [byte], id: &i [byte]) -> [heap, conn_read, conn_write] int {
+fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], payload: &p [byte], id: &i [byte], qos: int) -> [heap, conn_read, conn_write] int {
     let ev = box_slice(heap, 6 * 4, 0);
     let c0 = client.new(heap, 65536);
     let (c1, o1, rc) = client.open(heap, c0, buffer.empty(heap, 64), id, 0, true, "", "", "", "", 0, 0, 0);
@@ -69,16 +71,40 @@ fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], pay
         }
     }
     if status == 0 {
-        let (c3, o4, r1) = client.publish(heap, cl, out, topic, payload, 0, 0, 0);
+        let (c3, o4, r1) = client.publish(heap, cl, out, topic, payload, qos, 0, 0);
         cl = c3;
         out = o4;
-        if r1 != 0 {
+        if r1 < 0 {
             status = 3;
         }
         let (o5, sent2) = pump.send_out(conn, out);
         out = o5;
         if !sent2 {
             status = 5;
+        }
+        // QoS 1: wait for the PUBACK that names the packet id the machine gave.
+        var acked = qos == 0 || status != 0;
+        while !acked {
+            borrow mut ev as &!ew in {
+                let (c5, o8, n2, s2) = pump.pump(heap, conn, cl, 0, contents(ew), out);
+                cl = c5;
+                out = o8;
+                if s2 != 0 {
+                    status = 5;
+                    acked = true;
+                }
+                var k = 0;
+                while k < n2 && !acked {
+                    let e = contents(ew);
+                    if e[6 * k] == client.ev_acked() && e[6 * k + 1] == r1 && e[6 * k + 2] == 1 {
+                        acked = true;
+                    } else if e[6 * k] == client.ev_refused() {
+                        status = 3;
+                        acked = true;
+                    }
+                    k = k + 1;
+                }
+            }
         }
         let (c4, o6, r2) = client.disconnect(heap, cl, out, 0);
         cl = c4;
@@ -110,10 +136,16 @@ fn main(world: World) -> [] int {
                             borrow mut conn as &!ch in {
                                 borrow mut heap as &!h in {
                                     var id = "pub";
-                                    if arg_count(g) >= 6 {
-                                        status = run(h, ch, arg(g, 3), arg(g, 4), arg(g, 5));
+                                    var qos = 0;
+                                    if arg_count(g) >= 7 {
+                                        qos = number_of(arg(g, 6));
+                                    }
+                                    if qos < 0 || qos > 1 {
+                                        status = 2;
+                                    } else if arg_count(g) >= 6 {
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), arg(g, 5), qos);
                                     } else {
-                                        status = run(h, ch, arg(g, 3), arg(g, 4), id);
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), id, qos);
                                     }
                                 }
                             }
