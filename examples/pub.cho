@@ -2,9 +2,9 @@ edition 5;
 
 // `pub` -- connect to a broker, publish one message at QoS 0, disconnect.
 //
-//     pub <ipv4> <port> <topic> <payload> [<client-id> [<qos>]]
+//     pub <ipv4> <port> <topic> <payload> [<client-id> [<qos> [<retain>]]]
 //
-// With <qos> 1 it waits for the broker's PUBACK before it disconnects; QoS 0 is written and forgotten.
+// With <retain> 1 the broker keeps the message as the topic's last value; an empty payload with <retain> 1 clears it. With <qos> 1 it waits for the broker's PUBACK before it disconnects; QoS 0 is written and forgotten.
 //
 // Exit status: 0 published; 2 wrong arguments; 3 the broker refused the connection or sent something the client refused; 4 could not
 // connect; 5 the connection failed. The example of `docs/design.md` section 11, slice 2; it is a program, so its authority row is its own:
@@ -33,7 +33,7 @@ fn number_of[&t](text: &t [byte]) -> [] int {
     return n;
 }
 
-fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], payload: &p [byte], id: &i [byte], qos: int) -> [heap, conn_read, conn_write] int {
+fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], payload: &p [byte], id: &i [byte], qos: int, retain: int) -> [heap, conn_read, conn_write] int {
     let ev = box_slice(heap, 6 * 4, 0);
     let c0 = client.new(heap, 65536);
     let (c1, o1, rc) = client.open(heap, c0, buffer.empty(heap, 64), id, 0, true, "", "", "", "", 0, 0, 0);
@@ -71,7 +71,7 @@ fn run[&h, &c, &t, &p, &i](heap: &!h Heap, conn: &!c Conn, topic: &t [byte], pay
         }
     }
     if status == 0 {
-        let (c3, o4, r1) = client.publish(heap, cl, out, topic, payload, qos, 0, 0);
+        let (c3, o4, r1) = client.publish(heap, cl, out, topic, payload, qos, retain, 0);
         cl = c3;
         out = o4;
         if r1 < 0 {
@@ -140,12 +140,16 @@ fn main(world: World) -> [] int {
                                     if arg_count(g) >= 7 {
                                         qos = number_of(arg(g, 6));
                                     }
-                                    if qos < 0 || qos > 1 {
+                                    var retain = 0;
+                                    if arg_count(g) >= 8 {
+                                        retain = number_of(arg(g, 7));
+                                    }
+                                    if qos < 0 || qos > 1 || retain < 0 || retain > 1 {
                                         status = 2;
                                     } else if arg_count(g) >= 6 {
-                                        status = run(h, ch, arg(g, 3), arg(g, 4), arg(g, 5), qos);
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), arg(g, 5), qos, retain);
                                     } else {
-                                        status = run(h, ch, arg(g, 3), arg(g, 4), id, qos);
+                                        status = run(h, ch, arg(g, 3), arg(g, 4), id, qos, retain);
                                     }
                                 }
                             }

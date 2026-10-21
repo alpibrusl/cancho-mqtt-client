@@ -166,7 +166,7 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 
 (1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`)**; (2) the state machine: connect, publish QoS 0,
 subscribe, ping, with `pub`/`sub` **(built: `src/client.cho`, `examples/`; see section 14)**;
-(3) QoS 1 and the window **(built; see section 15)**; (4) will and retained; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
+(3) QoS 1 and the window **(built; see section 15)**; (4) will and retained **(built; see section 16)**; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
 ingest and simulator (in cancho-industrial, not here).
 
 ## 12. Open questions for the owner
@@ -247,3 +247,30 @@ Run here (the tests need no broker; the end-to-end run needs one):
 Not built: QoS 2 (a received QoS 2 PUBLISH is still refused); an automatic resend after a reconnect (slice 5); persistence of the held messages across a
 restart of the program (they live in the machine); the memory figure of section 5. The held bytes are bounded now; the inbox still is not
 (section 14).
+
+## 16. What slice 4 built, and what it did not
+
+**A finding first.** The sketch for this slice listed "will and retained handling" as new code. It is not: the library already carried both, from
+slice 1 (`put_connect` takes the will and its QoS and retain flag; `put_publish` takes `retain`; an incoming PUBLISH reports `qos + 4 * retain` in
+`ev_message`) and slice 2 (`open` and `publish` pass them through). What was missing was every check that they work in the machine and against a
+real broker, and a way to use them from the examples. The slice is that, and no library code changed.
+
+Built:
+
+- `tests/client_test.cho`: 18 tests (2 new). `test_will_rides_in_connect`: six refusals (will QoS 2, QoS 3, a retain flag of 2, a wildcard topic, a
+  message without a topic, a retain flag without a topic) each leave the machine closed and write nothing; then the exact CONNECT bytes for a QoS 1
+  retained will (connect flags `0x2E`) and for an empty message at QoS 0. `test_retain_flag_both_ways`: the first byte of PUBLISH at QoS 0 and 1 with
+  and without retain, a retain flag of 2 or -1 refused with nothing written, an empty retained payload (the way to clear one, 3.3.1-10), and an
+  incoming retained and live PUBLISH reported as 4 and 0.
+- `examples/pub` takes a retain argument; `examples/sub` ends a retained message's line with ` [retained]`; new `examples/will` connects with a
+  will and ends either by dropping the socket or by sending DISCONNECT.
+- `scripts/e2e.sh`, against a real cancho-mqtt: a live subscriber sees a retained message unmarked and a late one sees it marked; an empty retained
+  message clears it; a will is published when the socket drops, is not published after DISCONNECT, and a retained will is kept for a late
+  subscriber. The run took about 9 s, mostly its own waits.
+- `scripts/mutants.py`: 4 new variants of the machine (the will not sent, its retain flag not sent, the retain flag of PUBLISH not sent, an
+  incoming retained message reported as live), all killed, each by the unit tests and by the end-to-end run.
+
+Not built, and not claimed: will and retained behaviour against a second broker (Mosquitto is not installed here; section 9 still lists it as
+gate 3's other half); a will at QoS 1 end to end (the unit test covers its bytes; the example sends QoS 0); the broker's limits on a will's size
+and on the retained table (the broker's `limit.will-size` and `limit.retained` refusals are not provoked by any test here); reconnect and backoff
+(slice 5).

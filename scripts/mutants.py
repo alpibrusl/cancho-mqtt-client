@@ -53,6 +53,10 @@ CLIENT_MUTANTS = {
     "client-clean-session-keeps-held": ("a clean session keeps what was held", "        if clean_session {\n            kept = held_clear(heap, kept);", "        if clean_session && 1 == 2 {\n            kept = held_clear(heap, kept);"),
     "client-lost-session-keeps-held": ("a broker without our session leaves what was held in place", "                                        if contents(cw)[0] == 0 {\n                                            hd = held_clear(heap, hd);", "                                        if contents(cw)[0] == 7 {\n                                            hd = held_clear(heap, hd);"),
     "client-stray-puback-counts": ("a PUBACK that names nothing held is reported as matched", "                                        if was {\n                                            matched = 1;", "                                        if was || 1 == 1 {\n                                            matched = 1;"),
+    "client-will-dropped": ("open does not send the will it was given", "will_topic, will_message, will_qos, will_retain);\n        if n < 0 {", "\"\", \"\", 0, 0);\n        if n < 0 {"),
+    "client-will-retain-dropped": ("the will's retain flag is not sent", "will_topic, will_message, will_qos, will_retain);\n        if n < 0 {", "will_topic, will_message, will_qos, 0);\n        if n < 0 {"),
+    "client-publish-retain-dropped": ("publish does not send the retain flag", "codec.put_publish(packet, 0, topic, payload, qos, retain, 0, pid)", "codec.put_publish(packet, 0, topic, payload, qos, 0, 0, pid)"),
+    "client-incoming-retain-unreported": ("an incoming retained message is reported as live", "t[5] + 4 * t[6]);", "t[5]);"),
     "client-packet-id-not-fresh": ("a new QoS 1 message may take the id of a held one", "        pid0 = fresh(cr0, cr0.next_pid);\n        held_n = held_count(cr0.held);", "        pid0 = cr0.next_pid;\n        held_n = held_count(cr0.held);"),
 }
 

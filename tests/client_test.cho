@@ -247,6 +247,22 @@ fn do_publish[&h, &t, &p](heap: &!h Heap, r: Rig, topic: &t [byte], payload: &p 
     return Rig { c: c1, out: o1, log: log };
 }
 
+// OPEN with a will: topic, message, QoS, retain; the answer must be `want`.
+fn do_open_will[&h, &t, &m](heap: &!h Heap, r: Rig, topic: &t [byte], message: &m [byte], qos: int, retain: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.open(heap, c, out, "c", 0, true, "", "", topic, message, qos, retain, 0);
+    expect(rc, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+// PUBLISH with the retain flag `retain`.
+fn do_publish_retain[&h, &t, &p](heap: &!h Heap, r: Rig, topic: &t [byte], payload: &p [byte], qos: int, retain: int, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.publish(heap, c, out, topic, payload, qos, retain, now);
+    expect(rc, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
 // SUBSCRIBE (or UNSUBSCRIBE) to the one filter `text` at QoS `qos`; the packet id (or refusal) is `want`.
 fn do_sub[&h, &t](heap: &!h Heap, r: Rig, text: &t [byte], qos: int, now: int, subscribe: bool, want: int) -> [heap] Rig {
     let Rig { c, out, log } = r;
@@ -623,6 +639,55 @@ pub fn test_packet_ids_skip_what_is_held[&h](heap: &!h Heap) -> [heap] int {
     }
     r = check_inflight(r, 1);
     r = do_publish(heap, r, "t", "x", 1, 100, 2);
+    rig_drop(heap, r);
+    return 0;
+}
+
+// A will rides in CONNECT with its QoS and retain flag; a will that breaks a rule is refused and the machine stays closed (3.1.2-9 to 3.1.2-15).
+pub fn test_will_rides_in_connect[&h](heap: &!h Heap) -> [heap] int {
+    var r = rig(heap, 1024);
+    r = do_open_will(heap, r, "w/t", "bye", 2, 0, codec.e_qos2());
+    r = do_open_will(heap, r, "w/t", "bye", 3, 0, codec.e_argument());
+    r = do_open_will(heap, r, "w/t", "bye", 0, 2, codec.e_argument());
+    r = do_open_will(heap, r, "w/#", "bye", 0, 0, codec.e_topic());
+    r = do_open_will(heap, r, "", "bye", 0, 0, codec.e_argument());
+    r = do_open_will(heap, r, "", "", 0, 1, codec.e_argument());
+    r = check_state(r, client.s_closed());
+    r = check_wrote(r, "");
+    // QoS 1, retained: the will flag (4), QoS 1 (8) and retain (32) join clean session (2) in the connect flags, 0x2E.
+    r = do_open_will(heap, r, "w/t", "bye", 1, 1, 0);
+    r = check_wrote(r, "101700044D515454042E00000001630003772F740003627965");
+    r = check_state(r, client.s_connecting());
+    rig_drop(heap, r);
+    // A will at QoS 0, not retained, with an empty message.
+    var q = rig(heap, 1024);
+    q = do_open_will(heap, q, "w/t", "", 0, 0, 0);
+    q = check_wrote(q, "101400044D515454040600000001630003772F740000");
+    rig_drop(heap, q);
+    return 0;
+}
+
+// The retain flag goes out on PUBLISH at both QoS levels, and an incoming retained PUBLISH says so in the event (`e` = QoS + 4 * retain).
+pub fn test_retain_flag_both_ways[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 60, 1024);
+    r = do_publish_retain(heap, r, "a/b", "hi", 0, 1, 100, 0);
+    r = check_wrote(r, "31070003612F626869");
+    r = do_publish_retain(heap, r, "a/b", "hi", 1, 1, 101, 1);
+    r = check_wrote(r, "33090003612F6200016869");
+    r = do_publish_retain(heap, r, "a/b", "hi", 0, 0, 102, 0);
+    r = check_wrote(r, "30070003612F626869");
+    // Anything but 0 or 1 is refused and nothing is written.
+    r = do_publish_retain(heap, r, "a/b", "hi", 0, 2, 103, codec.e_argument());
+    r = do_publish_retain(heap, r, "a/b", "hi", 0, 0 - 1, 103, codec.e_argument());
+    r = check_wrote(r, "");
+    // An empty retained payload is how a retained message is cleared (3.3.1-10).
+    r = do_publish_retain(heap, r, "a/b", "", 0, 1, 104, 0);
+    r = check_wrote(r, "31050003612F62");
+    // In: QoS 0 retained, then QoS 0 live.
+    r = do_feed(heap, r, "310400017478", 200, 4, 1);
+    r = check_ev(r, 0, 5, 4);
+    r = do_feed(heap, r, "300400017478", 201, 4, 1);
+    r = check_ev(r, 1, 5, 0);
     rig_drop(heap, r);
     return 0;
 }
