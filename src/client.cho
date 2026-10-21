@@ -244,12 +244,17 @@ pub fn open[&h, &i, &u, &w, &t, &m](heap: &!h Heap, c: Client, out: buffer.Buffe
         return (c, out, codec.e_state());
     }
     let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
+    // A new connection starts with no half-read packet from the last one.
+    var fresh_rx = rx;
+    borrow mut fresh_rx as &!rw in {
+        buffer.clear(rw);
+    }
     let size = 11 + 2 * 5 + len(client_id) + len(user) + len(pass) + len(will_topic) + len(will_message) + 16;
     region a {
         let packet = alloc_slice[a](size, byte_of(0));
         let n = codec.put_connect(packet, 0, client_id, keepalive, clean_session, user, pass, will_topic, will_message, will_qos, will_retain);
         if n < 0 {
-            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, n);
+            return (Client { rx: fresh_rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid, held: held }, out, n);
         }
         let written = append_packet(heap, out, packet[0..n]);
         // A clean session starts with nothing held (3.1.2.4); a kept one keeps what was not acknowledged.
@@ -257,7 +262,7 @@ pub fn open[&h, &i, &u, &w, &t, &m](heap: &!h Heap, c: Client, out: buffer.Buffe
         if clean_session {
             kept = held_clear(heap, kept);
         }
-        return (Client { rx: rx, inbox: inbox, state: 1, keepalive_ms: keepalive * 1000, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid, held: kept }, written, 0);
+        return (Client { rx: fresh_rx, inbox: inbox, state: 1, keepalive_ms: keepalive * 1000, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid, held: kept }, written, 0);
     }
 }
 
@@ -463,6 +468,40 @@ pub fn disconnect[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -
         let written = append_packet(heap, out, packet[0..n]);
         return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid, held: held }, written, 0);
     }
+}
+
+// The caller says the connection is gone: the stream ended, a read or a write failed, or `tick` answered `e_keepalive`. The machine is closed
+// without a DISCONNECT. The held messages, the packet ids and the inbox stay (a kept session may need them); a half-read packet stays too, until `open` drops it.
+// Closed already: nothing changes.
+pub fn lost(c: Client) -> [] Client {
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid, held } = c;
+    return Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1, next_pid: next_pid, held: held };
+}
+
+pub fn max_backoff_base_ms() -> [] int {
+    return 60000;
+}
+
+pub fn max_backoff_ceiling_ms() -> [] int {
+    return 3600000;
+}
+
+// How long to wait before connection attempt number `failures` + 1: `base` times 2 to the power `failures`, never above `ceiling`. `base` 1 to
+// `max_backoff_base_ms`, `ceiling` from `base` to `max_backoff_ceiling_ms`, `failures` 0 or more; anything else is `e_argument`. No jitter.
+pub fn backoff_ms(base: int, ceiling: int, failures: int) -> [] int {
+    if base < 1 || base > max_backoff_base_ms() || ceiling < base || ceiling > max_backoff_ceiling_ms() || failures < 0 {
+        return codec.e_argument();
+    }
+    var d = base;
+    var n = 0;
+    while n < failures && d < ceiling {
+        d = d * 2;
+        n = n + 1;
+    }
+    if d > ceiling {
+        return ceiling;
+    }
+    return d;
 }
 
 // ---- time ----------------------------------------------------------------
