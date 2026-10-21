@@ -8,8 +8,9 @@ end-to-end run against a real broker (scripts/e2e.sh) also counts, and must itse
 
 `../cancho-mqtt` must be a checkout of cancho-mqtt (design section 9, gate 1).
 """
-import shutil
 import os
+import shutil
+import signal
 import pathlib
 import subprocess
 import sys
@@ -82,9 +83,15 @@ def run(source_text, client_text=None):
             shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(".git", "build"))
             (tree / "src" / "codec.cho").write_text(source_text)
             (tree / "src" / "client.cho").write_text(client.read_text())
-            r = subprocess.run(["bash", str(tree / "scripts" / "e2e.sh"), "18890"], capture_output=True, text=True)
-            if r.returncode != 0:
-                failed.append("e2e")
+            # A broken client can wait forever for an acknowledgement, so the script gets a deadline and its whole process group is stopped.
+            proc = subprocess.Popen(["bash", str(tree / "scripts" / "e2e.sh"), "18890"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                if proc.wait(timeout=60) != 0:
+                    failed.append("e2e")
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                failed.append("e2e (timed out)")
         return failed
 
 
