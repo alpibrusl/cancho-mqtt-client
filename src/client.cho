@@ -1,0 +1,489 @@
+edition 5;
+
+// `mqttc.client` -- the client state machine (design section 4): the caller owns the socket and the loop, this owns the protocol.
+//
+// The caller reads bytes from its connection and calls `feed`; it writes whatever the machine appended to `out`; it calls `tick`
+// with the time and waits at most what `tick` answers. Nothing here blocks, reads a clock or opens a socket: time is an argument
+// (milliseconds, any origin), the sockets are the caller's.
+//
+// Everything is bounded and total: a packet over `max_packet` is refused as soon as its header is read, a malformed packet is an
+// event and a closed connection, never a trap.
+
+module mqttc.client;
+
+import std.buffer;
+import mqttc.codec;
+
+// ---- states --------------------------------------------------------------
+
+pub fn s_closed() -> [] int {
+    return 0;
+}
+
+// CONNECT written, CONNACK not yet read.
+pub fn s_connecting() -> [] int {
+    return 1;
+}
+
+pub fn s_connected() -> [] int {
+    return 2;
+}
+
+// ---- events --------------------------------------------------------------
+
+// An event is `event_size()` ints in the caller's table: `[kind, a, b, c, d, e]`.
+pub fn event_size() -> [] int {
+    return 6;
+}
+
+// `a`: 1 when the broker kept the session.
+pub fn ev_connected() -> [] int {
+    return 1;
+}
+
+// `a`: the CONNACK return code (1 to 5). The connection is closed.
+pub fn ev_connack_refused() -> [] int {
+    return 2;
+}
+
+// `a`, `b`: offset and length of the topic in `inbox`; `c`, `d`: of the payload; `e`: qos + 4 * retain.
+pub fn ev_message() -> [] int {
+    return 3;
+}
+
+// `a`: the packet id; `b`: how many return codes; `c`: the first one (0, 1, 2 granted, 128 failure).
+pub fn ev_subscribed() -> [] int {
+    return 4;
+}
+
+// `a`: the packet id.
+pub fn ev_unsubscribed() -> [] int {
+    return 5;
+}
+
+// `a`: the packet id of a PUBACK (QoS 1 publishing is slice 3; the event exists so a broker's stray PUBACK is visible).
+pub fn ev_acked() -> [] int {
+    return 6;
+}
+
+// `a`: the refusal code (`codec.tag_of` names it). A protocol violation by the broker; the connection is closed.
+pub fn ev_refused() -> [] int {
+    return 7;
+}
+
+// ---- the machine ---------------------------------------------------------
+
+pub res struct Client {
+    // Bytes read and not yet a whole packet.
+    rx: buffer.Buffer,
+    // Copies of the topics and payloads of received messages, until the caller clears them (`clear_inbox`).
+    inbox: buffer.Buffer,
+    state: int,
+    keepalive_ms: int,
+    max_packet: int,
+    last_sent: int,
+    // When a PINGREQ was sent and nothing has been heard since; -1 when none is outstanding.
+    ping_sent: int,
+    next_pid: int,
+}
+
+pub fn new[&h](heap: &!h Heap, max_packet: int) -> [heap] Client {
+    var bound = max_packet;
+    if bound < 64 {
+        bound = 64;
+    }
+    return Client { rx: buffer.empty(heap, 256), inbox: buffer.empty(heap, 256), state: 0, keepalive_ms: 0, max_packet: bound, last_sent: 0, ping_sent: 0 - 1, next_pid: 1 };
+}
+
+pub fn drop[&h](heap: &!h Heap, c: Client) -> [heap] int {
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    buffer.drop(heap, rx);
+    buffer.drop(heap, inbox);
+    return state;
+}
+
+pub fn state[&c](c: &c Client) -> [] int {
+    return c.state;
+}
+
+// The copies of received topics and payloads that `ev_message` events point into.
+pub fn inbox[&c](c: &c Client) -> [] &c [byte] {
+    return buffer.bytes(c.inbox);
+}
+
+pub fn clear_inbox[&c](c: &!c Client) -> [] int {
+    return buffer.clear(c.inbox);
+}
+
+// The next packet id: 1 to 65535, never 0.
+fn bump(pid: int) -> [] int {
+    if pid >= 65535 {
+        return 1;
+    }
+    return pid + 1;
+}
+
+// A scratch slice for one small packet, appended to `out`.
+fn append_packet[&h, &p](heap: &!h Heap, out: buffer.Buffer, packet: &p [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, out, packet);
+}
+
+// ---- writing -------------------------------------------------------------
+
+// Open the connection: write CONNECT to `out` and wait for CONNACK. `keepalive` is in seconds (0: no keep-alive). Answers the machine, `out`, and 0 or a
+// refusal code (`e_state` when not closed; the codec's for an argument that breaks a rule).
+pub fn open[&h, &i, &u, &w, &t, &m](heap: &!h Heap, c: Client, out: buffer.Buffer, client_id: &i [byte], keepalive: int, clean_session: bool, user: &u [byte], pass: &w [byte], will_topic: &t [byte], will_message: &m [byte], will_qos: int, will_retain: int, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    var mp0 = 0;
+    var ka0 = 0;
+    var pid0 = 1;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+        mp0 = cr0.max_packet;
+        ka0 = cr0.keepalive_ms;
+        pid0 = cr0.next_pid;
+    }
+    if st0 != 0 {
+        return (c, out, codec.e_state());
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    let size = 11 + 2 * 5 + len(client_id) + len(user) + len(pass) + len(will_topic) + len(will_message) + 16;
+    region a {
+        let packet = alloc_slice[a](size, byte_of(0));
+        let n = codec.put_connect(packet, 0, client_id, keepalive, clean_session, user, pass, will_topic, will_message, will_qos, will_retain);
+        if n < 0 {
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, n);
+        }
+        let written = append_packet(heap, out, packet[0..n]);
+        return (Client { rx: rx, inbox: inbox, state: 1, keepalive_ms: keepalive * 1000, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid }, written, 0);
+    }
+}
+
+// PUBLISH at QoS 0 (QoS 1 publishing, with its window and retries, is slice 3: `qos` 1 is `e_argument` until then). Answers the machine,
+// `out`, and 0 or a refusal code (`e_state` when not connected).
+pub fn publish[&h, &t, &p](heap: &!h Heap, c: Client, out: buffer.Buffer, topic: &t [byte], payload: &p [byte], qos: int, retain: int, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    var mp0 = 0;
+    var ka0 = 0;
+    var pid0 = 1;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+        mp0 = cr0.max_packet;
+        ka0 = cr0.keepalive_ms;
+        pid0 = cr0.next_pid;
+    }
+    if st0 != 2 {
+        return (c, out, codec.e_state());
+    }
+    if qos != 0 {
+        return (c, out, codec.e_argument());
+    }
+    let size = codec.publish_size(len(topic), len(payload), 0);
+    if size > mp0 {
+        return (c, out, 0 - 3);
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    region a {
+        let packet = alloc_slice[a](size, byte_of(0));
+        let n = codec.put_publish(packet, 0, topic, payload, 0, retain, 0, 0);
+        if n < 0 {
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, n);
+        }
+        let written = append_packet(heap, out, packet[0..n]);
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: next_pid }, written, 0);
+    }
+}
+
+// SUBSCRIBE (`with_qos`) or UNSUBSCRIBE for the `n` filters `table` describes (see `codec.put_subscribe`). Answers the machine, `out`, and the
+// packet id used (1 to 65535) or a negative refusal code. The broker's answer is an `ev_subscribed` / `ev_unsubscribed` event with that id.
+fn filters[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [byte], table: &t [int], n: int, now: int, with_qos: bool) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    var mp0 = 0;
+    var ka0 = 0;
+    var pid0 = 1;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+        mp0 = cr0.max_packet;
+        ka0 = cr0.keepalive_ms;
+        pid0 = cr0.next_pid;
+    }
+    if st0 != 2 {
+        return (c, out, codec.e_state());
+    }
+    var size = 8;
+    var k = 0;
+    while k < n && k < codec.max_filters() && 3 * k + 1 < len(table) {
+        size = size + 3 + table[3 * k + 1];
+        k = k + 1;
+    }
+    if size > mp0 {
+        return (c, out, 0 - 3);
+    }
+    let pid = pid0;
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    region a {
+        let packet = alloc_slice[a](size + 8, byte_of(0));
+        var written = 0 - 1;
+        if with_qos {
+            written = codec.put_subscribe(packet, 0, pid, data, table, n);
+        } else {
+            written = codec.put_unsubscribe(packet, 0, pid, data, table, n);
+        }
+        if written < 0 {
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, written);
+        }
+        let appended = append_packet(heap, out, packet[0..written]);
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: ping_sent, next_pid: bump(next_pid) }, appended, pid);
+    }
+}
+
+pub fn subscribe[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [byte], table: &t [int], n: int, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    return filters(heap, c, out, data, table, n, now, true);
+}
+
+pub fn unsubscribe[&h, &d, &t](heap: &!h Heap, c: Client, out: buffer.Buffer, data: &d [byte], table: &t [int], n: int, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    return filters(heap, c, out, data, table, n, now, false);
+}
+
+// DISCONNECT, and the machine is closed (3.14.4: the broker discards the will).
+pub fn disconnect[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    var mp0 = 0;
+    var ka0 = 0;
+    var pid0 = 1;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+        mp0 = cr0.max_packet;
+        ka0 = cr0.keepalive_ms;
+        pid0 = cr0.next_pid;
+    }
+    if st0 != 2 {
+        return (c, out, codec.e_state());
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    region a {
+        let packet = alloc_slice[a](2, byte_of(0));
+        let n = codec.put_disconnect(packet, 0);
+        let written = append_packet(heap, out, packet[0..n]);
+        return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: 0 - 1, next_pid: next_pid }, written, 0);
+    }
+}
+
+// ---- time ----------------------------------------------------------------
+
+// The grace after a PINGREQ before the broker is declared silent (choice: half the keep-alive, at least a second).
+fn grace(keepalive_ms: int) -> [] int {
+    if keepalive_ms / 2 < 1000 {
+        return 1000;
+    }
+    return keepalive_ms / 2;
+}
+
+// How long the caller may wait before calling `tick` again when nothing else happens.
+pub fn idle_ms() -> [] int {
+    return 60000;
+}
+
+// Call with the time whenever it may have moved. Appends a PINGREQ to `out` when the connection has been quiet for the keep-alive.
+// Answers the machine, `out`, and either the milliseconds until `tick` must be called again (0 or more), or `e_keepalive` (negative:
+// the broker was silent for the keep-alive and the grace; the machine is closed).
+pub fn tick[&h](heap: &!h Heap, c: Client, out: buffer.Buffer, now: int) -> [heap] (Client, buffer.Buffer, int) {
+    var st0 = 0;
+    var mp0 = 0;
+    var ka0 = 0;
+    var pid0 = 1;
+    borrow c as &cr0 in {
+        st0 = cr0.state;
+        mp0 = cr0.max_packet;
+        ka0 = cr0.keepalive_ms;
+        pid0 = cr0.next_pid;
+    }
+    if st0 != 2 || ka0 == 0 {
+        return (c, out, idle_ms());
+    }
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    if ping_sent >= 0 {
+        let due = ping_sent + grace(keepalive_ms);
+        if now >= due {
+            return (Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1, next_pid: next_pid }, out, codec.e_keepalive());
+        }
+        return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, due - now);
+    }
+    let due = last_sent + keepalive_ms;
+    if now >= due {
+        region a {
+            let packet = alloc_slice[a](2, byte_of(0));
+            let n = codec.put_pingreq(packet, 0);
+            let written = append_packet(heap, out, packet[0..n]);
+            return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: now, ping_sent: now, next_pid: next_pid }, written, grace(keepalive_ms));
+        }
+    }
+    return (Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: ping_sent, next_pid: next_pid }, out, due - now);
+}
+
+// ---- reading -------------------------------------------------------------
+
+// Write the event `kind` with its fields at event number `at` of `events`.
+fn emit[&e](events: &!e [int], at: int, kind: int, a: int, b: int, c: int, d: int, e: int) -> [] int {
+    let base = at * 6;
+    events[base] = kind;
+    events[base + 1] = a;
+    events[base + 2] = b;
+    events[base + 3] = c;
+    events[base + 4] = d;
+    events[base + 5] = e;
+    return at + 1;
+}
+
+// Feed bytes the caller read. Appends to `out` whatever must be sent in answer (a PUBACK for a QoS 1 message), fills `events`
+// (`event_size()` ints each) and answers the machine, `out` and how many events were written. If `events` fills before the bytes are
+// used up, the rest stays inside the machine: call `feed` again with no bytes to continue. A broker packet that breaks a rule is an
+// `ev_refused` event and the machine is closed; bytes after it are dropped.
+pub fn feed[&h, &d, &e](heap: &!h Heap, c: Client, data: &d [byte], now: int, events: &!e [int], out: buffer.Buffer) -> [heap] (Client, buffer.Buffer, int) {
+    let Client { rx, inbox, state, keepalive_ms, max_packet, last_sent, ping_sent, next_pid } = c;
+    // A closed machine takes no input: what the caller sent is dropped.
+    var received = rx;
+    if state != 0 {
+        received = buffer.append(heap, received, data);
+    }
+    var box = inbox;
+    var answer = out;
+    var st = state;
+    var ping = ping_sent;
+    var sent = last_sent;
+    var ne = 0;
+    var used = 0;
+    let room = len(events) / 6;
+    let pt = box_slice(heap, codec.publish_slots(), 0);
+    let sbt = box_slice(heap, codec.suback_slots(), 0);
+    let cat = box_slice(heap, codec.connack_slots(), 0);
+    var going = st != 0;
+    while going && ne < room {
+        var stop = false;
+        borrow received as &rr in {
+            let all = buffer.bytes(rr);
+            let rest = all[used..len(all)];
+            let total = codec.header(rest, max_packet);
+            if total == codec.incomplete() {
+                stop = true;
+            } else if total < 0 {
+                ne = emit(events, ne, ev_refused(), total, 0, 0, 0, 0);
+                st = 0;
+                stop = true;
+            } else if total > len(rest) {
+                stop = true;
+            } else {
+                let packet = rest[0..total];
+                let k = codec.kind(packet);
+                var refusal = codec.check_kind(k, codec.flags(packet));
+                if refusal == 0 {
+                    // CONNACK is the first packet and only the first; nothing else may come before it.
+                    if st == 1 && k != 2 {
+                        refusal = codec.e_unexpected();
+                    }
+                    if st == 2 && k == 2 {
+                        refusal = codec.e_unexpected();
+                    }
+                }
+                if refusal != 0 {
+                    ne = emit(events, ne, ev_refused(), refusal, 0, 0, 0, 0);
+                    st = 0;
+                    stop = true;
+                } else {
+                    // Any packet from the broker shows it is alive (choice, design section 4).
+                    ping = 0 - 1;
+                    borrow mut cat as &!cw in {
+                        borrow mut pt as &!pw in {
+                            borrow mut sbt as &!sw in {
+                                if k == 2 {
+                                    let rc = codec.decode_connack(packet, contents(cw));
+                                    if rc != 0 {
+                                        ne = emit(events, ne, ev_refused(), rc, 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    } else if contents(cw)[1] != 0 {
+                                        ne = emit(events, ne, ev_connack_refused(), contents(cw)[1], 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    } else {
+                                        ne = emit(events, ne, ev_connected(), contents(cw)[0], 0, 0, 0, 0);
+                                        st = 2;
+                                    }
+                                } else if k == 3 {
+                                    let rc = codec.decode_publish(packet, contents(pw));
+                                    if rc != 0 {
+                                        ne = emit(events, ne, ev_refused(), rc, 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    } else {
+                                        let t = contents(pw);
+                                        var at = 0;
+                                        borrow box as &bx in {
+                                            at = buffer.size(bx);
+                                        }
+                                        box = buffer.append(heap, box, packet[t[0]..t[0] + t[1]]);
+                                        box = buffer.append(heap, box, packet[t[3]..t[3] + t[4]]);
+                                        ne = emit(events, ne, ev_message(), at, t[1], at + t[1], t[4], t[5] + 4 * t[6]);
+                                        if t[5] == 1 {
+                                            region a {
+                                                let ack = alloc_slice[a](4, byte_of(0));
+                                                let an = codec.put_puback(ack, 0, t[2]);
+                                                answer = append_packet(heap, answer, ack[0..an]);
+                                            }
+                                            sent = now;
+                                        }
+                                    }
+                                } else if k == 9 {
+                                    let rc = codec.decode_suback(packet, contents(sw));
+                                    if rc != 0 {
+                                        ne = emit(events, ne, ev_refused(), rc, 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    } else {
+                                        ne = emit(events, ne, ev_subscribed(), contents(sw)[0], contents(sw)[1], contents(sw)[2], 0, 0);
+                                    }
+                                } else if k == 11 || k == 4 {
+                                    let pid = codec.decode_pid(packet);
+                                    if pid < 0 {
+                                        ne = emit(events, ne, ev_refused(), pid, 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    } else if k == 11 {
+                                        ne = emit(events, ne, ev_unsubscribed(), pid, 0, 0, 0, 0);
+                                    } else {
+                                        ne = emit(events, ne, ev_acked(), pid, 0, 0, 0, 0);
+                                    }
+                                } else {
+                                    // PINGRESP (13): nothing to report; `ping` is already clear.
+                                    let rc = codec.decode_empty(packet);
+                                    if rc != 0 {
+                                        ne = emit(events, ne, ev_refused(), rc, 0, 0, 0, 0);
+                                        st = 0;
+                                        stop = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    used = used + total;
+                }
+            }
+        }
+        if stop {
+            going = false;
+        }
+    }
+    // Keep the bytes not yet used.
+    var kept = buffer.empty(heap, 64);
+    if st != 0 {
+        borrow received as &rr in {
+            let all = buffer.bytes(rr);
+            kept = buffer.append(heap, kept, all[used..len(all)]);
+        }
+    }
+    buffer.drop(heap, received);
+    unbox_slice(heap, pt);
+    unbox_slice(heap, sbt);
+    unbox_slice(heap, cat);
+    return (Client { rx: kept, inbox: box, state: st, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: sent, ping_sent: ping, next_pid: next_pid }, answer, ne);
+}

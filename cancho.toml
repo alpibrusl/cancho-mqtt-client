@@ -1,5 +1,5 @@
 # cancho-mqtt-client's project file: the compiler these sources are written for. The compiler revision is part of the contract
-# (a package store records no hash of the `std` it was published against); it is also CI's CANCHO_REV (design section 8).
+# (a package store records no hash of the `std` it was published against); it is also CI's CLIENT_COMPILER_REV (design section 8).
 
 [package]
 name = "mqtt-client"
@@ -16,3 +16,21 @@ std = true
 name = "broker"
 sources = ["../cancho-mqtt/src/wire.cho", "src/codec.cho", "tests/broker_test.cho"]
 std = true
+
+[[test]]
+name = "client"
+sources = ["src/codec.cho", "src/client.cho", "tests/client_test.cho"]
+std = true
+
+# The two example programs (design section 11, slice 2): the caller's side of the state machine, over a blocking connection.
+[[bin]]
+name = "pub"
+sources = ["examples/pump.cho", "examples/pub.cho", "src/codec.cho", "src/client.cho"]
+std = true
+out = "build/pub"
+
+[[bin]]
+name = "sub"
+sources = ["examples/pump.cho", "examples/sub.cho", "src/codec.cho", "src/client.cho"]
+std = true
+out = "build/sub"

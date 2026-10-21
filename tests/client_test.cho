@@ -1,0 +1,533 @@
+edition 5;
+
+import std.buffer;
+import std.test;
+import std.vec;
+import mqttc.codec;
+import mqttc.client;
+
+fn nibble(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return 0 - 1;
+}
+
+// Write the bytes `hex` spells at the front of `dst`; answers how many.
+fn unhex[&d, &t](dst: &!d [byte], hex: &t [byte]) -> [] int {
+    var i = 0;
+    while i + 1 < len(hex) {
+        dst[i / 2] = byte_of(nibble(int_of(hex[i])) * 16 + nibble(int_of(hex[i + 1])));
+        i = i + 2;
+    }
+    return len(hex) / 2;
+}
+
+// Are the `n` bytes of `got` exactly the bytes `hex` spells?
+fn matches[&g, &t](got: &g [byte], n: int, hex: &t [byte]) -> [] bool {
+    if n != len(hex) / 2 {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if int_of(got[i]) != nibble(int_of(hex[2 * i])) * 16 + nibble(int_of(hex[2 * i + 1])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- a rig: the machine, what it wrote, and every event it has reported ------------------------
+//
+// Every helper takes the rig and answers it, and the ones named `check_*` and `do_*` make their assertion inside, so a test reads as a
+// sequence: `r = do_feed(heap, r, "20020000", 100, 4, 1);`.
+
+res struct Rig {
+    c: client.Client,
+    out: buffer.Buffer,
+    log: vec.Vec[int],
+}
+
+fn rig[&h](heap: &!h Heap, max_packet: int) -> [heap] Rig {
+    return Rig { c: client.new(heap, max_packet), out: buffer.empty(heap, 64), log: vec.empty(heap, 24, 0) };
+}
+
+fn rig_drop[&h](heap: &!h Heap, r: Rig) -> [heap] int {
+    let Rig { c, out, log } = r;
+    client.drop(heap, c);
+    buffer.drop(heap, out);
+    vec.drop(heap, log);
+    return 0;
+}
+
+fn check_state(r: Rig, want: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    borrow c as &cr in {
+        test.assert_eq(client.state(cr), want);
+    }
+    return Rig { c: c, out: out, log: log };
+}
+
+// What the machine has written is exactly `hex` (empty: nothing); then it is forgotten.
+fn check_wrote[&t](r: Rig, hex: &t [byte]) -> [] Rig {
+    let Rig { c, out, log } = r;
+    var o = out;
+    borrow o as &ob in {
+        test.assert(matches(buffer.bytes(ob), buffer.size(ob), hex));
+    }
+    borrow mut o as &!ow in {
+        buffer.clear(ow);
+    }
+    return Rig { c: c, out: o, log: log };
+}
+
+// Field `f` (0 kind, 1 a, ... 5 e) of event `i` is `want`.
+fn check_ev(r: Rig, i: int, f: int, want: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    borrow log as &lr in {
+        test.assert_eq(vec.get(lr, 6 * i + f), want);
+    }
+    return Rig { c: c, out: out, log: log };
+}
+
+fn check_count(r: Rig, want: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    borrow log as &lr in {
+        test.assert_eq(vec.size(lr) / 6, want);
+    }
+    return Rig { c: c, out: out, log: log };
+}
+
+// The inbox holds `size` bytes and the byte at `at` is `want`.
+fn check_inbox(r: Rig, size: int, at: int, want: int) -> [] Rig {
+    let Rig { c, out, log } = r;
+    borrow c as &cr in {
+        let box = client.inbox(cr);
+        test.assert_eq(len(box), size);
+        if size > 0 {
+            test.assert_eq(int_of(box[at]), want);
+        }
+    }
+    return Rig { c: c, out: out, log: log };
+}
+
+fn clear_inbox(r: Rig) -> [] Rig {
+    let Rig { c, out, log } = r;
+    var cc = c;
+    borrow mut cc as &!cw in {
+        client.clear_inbox(cw);
+    }
+    return Rig { c: cc, out: out, log: log };
+}
+
+// Forget what the machine has written.
+fn wipe(r: Rig) -> [] Rig {
+    let Rig { c, out, log } = r;
+    var o = out;
+    borrow mut o as &!ow in {
+        buffer.clear(ow);
+    }
+    return Rig { c: c, out: o, log: log };
+}
+
+// Assert `got == want`, unless `want` is the sentinel meaning "any answer" (the sweeps).
+fn expect(got: int, want: int) -> [] int {
+    if want != 0 - 99999 {
+        test.assert_eq(got, want);
+    }
+    return 0;
+}
+
+fn do_open[&h](heap: &!h Heap, r: Rig, keepalive: int, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.open(heap, c, out, "c", keepalive, true, "", "", "", "", 0, 0, now);
+    test.assert_eq(rc, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+// Feed `bytes` with room for `room` events, expect `want` events reported; they join the log.
+fn do_feed_raw[&h, &b](heap: &!h Heap, r: Rig, bytes: &b [byte], now: int, room: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let table = box_slice(heap, 6 * room, 0);
+    var lg = log;
+    var cc = c;
+    var oo = out;
+    borrow mut table as &!tw in {
+        let (c1, o1, k) = client.feed(heap, cc, bytes, now, contents(tw), oo);
+        cc = c1;
+        oo = o1;
+        if want >= 0 {
+            test.assert_eq(k, want);
+        }
+        var i = 0;
+        while i < 6 * k {
+            lg = vec.push(heap, lg, contents(tw)[i]);
+            i = i + 1;
+        }
+    }
+    unbox_slice(heap, table);
+    return Rig { c: cc, out: oo, log: lg };
+}
+
+// The same with the bytes `hex` spells.
+fn do_feed[&h, &t](heap: &!h Heap, r: Rig, hex: &t [byte], now: int, room: int, want: int) -> [heap] Rig {
+    region a {
+        let b = alloc_slice[a](len(hex) / 2 + 1, byte_of(0));
+        let used = unhex(b, hex);
+        return do_feed_raw(heap, r, b[0..used], now, room, want);
+    }
+}
+
+// Tick at `now`; the wait it answers is `want`.
+fn do_tick[&h](heap: &!h Heap, r: Rig, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, w) = client.tick(heap, c, out, now);
+    expect(w, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+fn do_publish[&h, &t, &p](heap: &!h Heap, r: Rig, topic: &t [byte], payload: &p [byte], qos: int, now: int, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    let (c1, o1, rc) = client.publish(heap, c, out, topic, payload, qos, 0, now);
+    expect(rc, want);
+    return Rig { c: c1, out: o1, log: log };
+}
+
+// SUBSCRIBE (or UNSUBSCRIBE) to the one filter `text` at QoS `qos`; the packet id (or refusal) is `want`.
+fn do_sub[&h, &t](heap: &!h Heap, r: Rig, text: &t [byte], qos: int, now: int, subscribe: bool, want: int) -> [heap] Rig {
+    let Rig { c, out, log } = r;
+    var cc = c;
+    var oo = out;
+    region a {
+        let table = alloc_slice[a](3, 0);
+        table[0] = 0;
+        table[1] = len(text);
+        table[2] = qos;
+        if subscribe {
+            let (c1, o1, p) = client.subscribe(heap, cc, oo, text, table, 1, now);
+            cc = c1;
+            oo = o1;
+            expect(p, want);
+        } else {
+            let (c1, o1, p) = client.unsubscribe(heap, cc, oo, text, table, 1, now);
+            cc = c1;
+            oo = o1;
+            expect(p, want);
+        }
+    }
+    return Rig { c: cc, out: oo, log: log };
+}
+
+// A rig that has opened (keep-alive in seconds) at time 0 and been answered with CONNACK 0 at time 100; nothing is left in `out`.
+fn connected[&h](heap: &!h Heap, keepalive: int, max_packet: int) -> [heap] Rig {
+    var r = rig(heap, max_packet);
+    r = do_open(heap, r, keepalive, 0, 0);
+    r = do_feed(heap, r, "20020000", 100, 4, 1);
+    r = check_state(r, client.s_connected());
+    // Start the test with nothing written and no events reported: the Connected event is not the test's.
+    let Rig { c, out, log } = wipe(r);
+    vec.drop(heap, log);
+    return Rig { c: c, out: out, log: vec.empty(heap, 24, 0) };
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+pub fn test_open_and_connack[&h](heap: &!h Heap) -> [heap] int {
+    var r = rig(heap, 1024);
+    r = do_open(heap, r, 60, 1000, 0);
+    r = check_wrote(r, "100D00044D5154540402003C000163");
+    r = check_state(r, client.s_connecting());
+    // A second open while connecting is refused; the machine is unchanged.
+    r = do_open(heap, r, 60, 1000, codec.e_state());
+    r = check_state(r, client.s_connecting());
+    // CONNACK, session present.
+    r = do_feed(heap, r, "20020100", 1500, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_connected());
+    r = check_ev(r, 0, 1, 1);
+    r = check_state(r, client.s_connected());
+    // A second CONNACK is a protocol violation: refused, closed.
+    r = do_feed(heap, r, "20020000", 1600, 4, 1);
+    r = check_ev(r, 1, 0, client.ev_refused());
+    r = check_ev(r, 1, 1, codec.e_unexpected());
+    r = check_state(r, client.s_closed());
+    // A closed machine takes no input.
+    r = do_feed(heap, r, "20020000", 1700, 4, 0);
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_connack_refused[&h](heap: &!h Heap) -> [heap] int {
+    var r = rig(heap, 1024);
+    r = do_open(heap, r, 60, 0, 0);
+    r = do_feed(heap, r, "20020005", 10, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_connack_refused());
+    r = check_ev(r, 0, 1, 5);
+    r = check_state(r, client.s_closed());
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_nothing_before_connack[&h](heap: &!h Heap) -> [heap] int {
+    var r = rig(heap, 1024);
+    r = do_publish(heap, r, "a/b", "hi", 0, 5, codec.e_state());
+    r = do_sub(heap, r, "a/#", 1, 5, true, codec.e_state());
+    r = do_open(heap, r, 60, 0, 0);
+    // Opened but not answered: still nothing but CONNECT has gone out.
+    r = check_wrote(r, "100D00044D5154540402003C000163");
+    r = do_publish(heap, r, "a/b", "hi", 0, 5, codec.e_state());
+    r = do_sub(heap, r, "a/#", 1, 5, true, codec.e_state());
+    r = check_wrote(r, "");
+    // A PUBLISH before CONNACK is not allowed.
+    r = do_feed(heap, r, "30070003612F626869", 5, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_refused());
+    r = check_ev(r, 0, 1, codec.e_unexpected());
+    r = check_state(r, client.s_closed());
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_publish_subscribe_unsubscribe[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 60, 1024);
+    // PUBLISH at QoS 0: exact bytes. QoS 1 publishing is slice 3. A wildcard in the name is the codec's refusal.
+    r = do_publish(heap, r, "a/b", "hi", 0, 200, 0);
+    r = check_wrote(r, "30070003612F626869");
+    r = do_publish(heap, r, "a/b", "hi", 1, 200, codec.e_argument());
+    r = do_publish(heap, r, "a/#", "hi", 0, 200, codec.e_topic());
+    r = check_wrote(r, "");
+    // SUBSCRIBE "a/#" at QoS 1: packet id 1; a second gets 2.
+    r = do_sub(heap, r, "a/#", 1, 300, true, 1);
+    r = check_wrote(r, "820800010003612F2301");
+    r = do_sub(heap, r, "b/+", 0, 300, true, 2);
+    r = check_wrote(r, "820800020003622F2B00");
+    // The broker's answer: packet id 1, granted QoS 1.
+    r = do_feed(heap, r, "9003000101", 310, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_subscribed());
+    r = check_ev(r, 0, 1, 1);
+    r = check_ev(r, 0, 2, 1);
+    r = check_ev(r, 0, 3, 1);
+    // UNSUBSCRIBE: packet id 3, answered.
+    r = do_sub(heap, r, "a/#", 0, 320, false, 3);
+    r = check_wrote(r, "A20700030003612F23");
+    r = do_feed(heap, r, "B0020003", 330, 4, 1);
+    r = check_ev(r, 1, 0, client.ev_unsubscribed());
+    r = check_ev(r, 1, 1, 3);
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_incoming_publish_in_fragments[&h](heap: &!h Heap) -> [heap] int {
+    // QoS 1, retained: topic t, payload x, packet id 5, a byte at a time. One event when the last byte arrives, then the PUBACK.
+    var r = connected(heap, 60, 1024);
+    r = do_feed(heap, r, "33", 400, 4, 0);
+    r = do_feed(heap, r, "06", 401, 4, 0);
+    r = do_feed(heap, r, "0001", 402, 4, 0);
+    r = do_feed(heap, r, "74", 403, 4, 0);
+    r = do_feed(heap, r, "0005", 404, 4, 0);
+    r = check_wrote(r, "");
+    r = do_feed(heap, r, "78", 410, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_message());
+    r = check_ev(r, 0, 1, 0);
+    r = check_ev(r, 0, 2, 1);
+    r = check_ev(r, 0, 3, 1);
+    r = check_ev(r, 0, 4, 1);
+    // qos 1 and retain: 1 + 4 * 1
+    r = check_ev(r, 0, 5, 5);
+    r = check_wrote(r, "40020005");
+    // The inbox holds the topic then the payload, where the event says.
+    r = check_inbox(r, 2, 0, 116);
+    r = check_inbox(r, 2, 1, 120);
+    r = clear_inbox(r);
+    r = check_inbox(r, 0, 0, 0);
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_two_packets_and_a_small_event_table[&h](heap: &!h Heap) -> [heap] int {
+    // Two QoS 0 messages in one feed, room for one event: the second stays inside until the next feed.
+    var r = connected(heap, 60, 1024);
+    r = do_feed(heap, r, "300400017478300400017479", 500, 1, 1);
+    r = do_feed(heap, r, "", 500, 1, 1);
+    r = do_feed(heap, r, "", 500, 1, 0);
+    r = check_count(r, 2);
+    // Topic and payload of the first at 0 and 1, of the second at 2 and 3.
+    r = check_ev(r, 0, 1, 0);
+    r = check_ev(r, 0, 3, 1);
+    r = check_ev(r, 1, 1, 2);
+    r = check_ev(r, 1, 3, 3);
+    // QoS 0 needs no PUBACK.
+    r = check_wrote(r, "");
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_keepalive[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 10, 1024);
+    // Quiet for less than the keep-alive: nothing is sent, and tick says how long to wait (last sent at 0, due at 10000).
+    r = do_tick(heap, r, 5000, 5000);
+    r = check_wrote(r, "");
+    // At the keep-alive: PINGREQ, and the grace (half the keep-alive) starts.
+    r = do_tick(heap, r, 10000, 5000);
+    r = check_wrote(r, "C000");
+    // Inside the grace: nothing more.
+    r = do_tick(heap, r, 12000, 3000);
+    r = check_wrote(r, "");
+    // PINGRESP clears it; the next PINGREQ is a keep-alive after the last one was sent.
+    r = do_feed(heap, r, "D000", 12500, 4, 0);
+    r = do_tick(heap, r, 12500, 7500);
+    r = check_wrote(r, "");
+    r = do_tick(heap, r, 20000, 5000);
+    r = check_wrote(r, "C000");
+    // Silence through the grace: the broker is declared silent and the machine closes.
+    r = do_tick(heap, r, 25000, codec.e_keepalive());
+    r = check_state(r, client.s_closed());
+    rig_drop(heap, r);
+    // No keep-alive, no pings.
+    var q = connected(heap, 0, 1024);
+    q = do_tick(heap, q, 99999999, client.idle_ms());
+    q = check_wrote(q, "");
+    rig_drop(heap, q);
+    return 0;
+}
+
+// Any packet from the broker shows it is alive, not only PINGRESP.
+pub fn test_any_packet_counts_as_alive[&h](heap: &!h Heap) -> [heap] int {
+    var r = connected(heap, 10, 1024);
+    r = do_tick(heap, r, 10000, 5000);
+    r = do_feed(heap, r, "300400017478", 11000, 4, 1);
+    r = do_tick(heap, r, 16000, 4000);
+    r = check_state(r, client.s_connected());
+    rig_drop(heap, r);
+    return 0;
+}
+
+// A broker packet that breaks a rule is an event and a closed connection.
+fn refuses[&h, &t](heap: &!h Heap, hex: &t [byte], max_packet: int, code: int) -> [heap] int {
+    var r = connected(heap, 60, max_packet);
+    r = do_feed(heap, r, hex, 600, 4, 1);
+    r = check_ev(r, 0, 0, client.ev_refused());
+    r = check_ev(r, 0, 1, code);
+    r = check_state(r, client.s_closed());
+    rig_drop(heap, r);
+    return 0;
+}
+
+pub fn test_refusals[&h](heap: &!h Heap) -> [heap] int {
+    // A reserved packet type, a bad length, a packet over the bound, QoS 2, a packet id of 0, a PUBACK that is too short.
+    refuses(heap, "FF00", 1024, codec.e_malformed());
+    refuses(heap, "30FFFFFFFF", 1024, codec.bad_length());
+    refuses(heap, "30FF7F", 64, codec.too_large());
+    refuses(heap, "3406000174000578", 1024, codec.e_qos2());
+    refuses(heap, "40020000", 1024, codec.e_packet_id());
+    refuses(heap, "400101", 1024, codec.e_malformed());
+    // A packet the broker never sends.
+    refuses(heap, "C000", 1024, codec.e_unexpected());
+    // The QoS 2 handshake.
+    refuses(heap, "50020001", 1024, codec.e_qos2());
+    return 0;
+}
+
+pub fn test_disconnect[&h](heap: &!h Heap) -> [heap] int {
+    let r0 = connected(heap, 60, 1024);
+    let Rig { c, out, log } = r0;
+    let (c1, o1, rc) = client.disconnect(heap, c, out, 700);
+    test.assert_eq(rc, 0);
+    var r = Rig { c: c1, out: o1, log: log };
+    r = check_wrote(r, "E000");
+    r = check_state(r, client.s_closed());
+    r = do_publish(heap, r, "a/b", "hi", 0, 800, codec.e_state());
+    rig_drop(heap, r);
+    return 0;
+}
+
+// ---- no input reaches a trap -------------------------------------------------------------------
+
+fn next(seed: int) -> [] int {
+    return (seed * 1103515245 + 12345) % 2147483648;
+}
+
+fn corpus(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "20020100";
+    }
+    if i == 1 {
+        return "30070003612F626869";
+    }
+    if i == 2 {
+        return "3306000174000578";
+    }
+    if i == 3 {
+        return "9006000700000180";
+    }
+    if i == 4 {
+        return "40020102";
+    }
+    if i == 5 {
+        return "B0020001";
+    }
+    if i == 6 {
+        return "D000";
+    }
+    return "3A06000174000578";
+}
+
+pub fn test_no_input_reaches_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    var seed = 4242;
+    var round = 0;
+    while round < 300 {
+        var r = rig(heap, 128);
+        seed = next(seed);
+        if seed / 256 % 4 != 0 {
+            r = do_open(heap, r, seed / 256 % 5, round * 10, 0);
+        }
+        var step = 0;
+        while step < 12 {
+            seed = next(seed);
+            let what = seed / 256 % 6;
+            let now = round * 10 + step * 4000;
+            if what == 0 {
+                // A valid packet of the corpus.
+                r = do_feed(heap, r, corpus(seed / 4096 % 8), now, 2, 0 - 1);
+            } else if what == 1 {
+                // Random bytes in a random chunk.
+                region a {
+                    let b = alloc_slice[a](24, byte_of(0));
+                    var i = 0;
+                    while i < len(b) {
+                        seed = next(seed);
+                        b[i] = byte_of(seed / 256 % 40);
+                        i = i + 1;
+                    }
+                    seed = next(seed);
+                    r = do_feed_raw(heap, r, b[0..seed / 256 % 25], now, 2, 0 - 1);
+                }
+            } else if what == 2 {
+                r = do_tick(heap, r, now, 0 - 99999);
+            } else if what == 3 {
+                r = do_sub(heap, r, "a/#", 1, now, seed / 4096 % 2 == 0, 0 - 99999);
+            } else if what == 4 {
+                r = do_publish(heap, r, "t", "x", seed / 4096 % 2, now, 0 - 99999);
+            } else {
+                // A byte at a time.
+                region a {
+                    let b = alloc_slice[a](1, byte_of(0));
+                    var i = 0;
+                    while i < 6 {
+                        seed = next(seed);
+                        b[0] = byte_of(seed / 256 % 64);
+                        r = do_feed_raw(heap, r, b, now, 1, 0 - 1);
+                        i = i + 1;
+                    }
+                }
+            }
+            r = wipe(r);
+            step = step + 1;
+        }
+        rig_drop(heap, r);
+        round = round + 1;
+    }
+    return 0;
+}
