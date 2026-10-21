@@ -166,7 +166,7 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 
 (1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`)**; (2) the state machine: connect, publish QoS 0,
 subscribe, ping, with `pub`/`sub` **(built: `src/client.cho`, `examples/`; see section 14)**;
-(3) QoS 1 and the window **(built; see section 15)**; (4) will and retained **(built; see section 16)**; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
+(3) QoS 1 and the window **(built; see section 15)**; (4) will and retained **(built; see section 16)**; (5) reconnect and backoff **(built; see the end of section 17)**; (6) the package store and its check; (7) the platform's
 ingest and simulator (in cancho-industrial, not here).
 
 ## 12. Open questions for the owner
@@ -274,3 +274,60 @@ Not built, and not claimed: will and retained behaviour against a second broker 
 gate 3's other half); a will at QoS 1 end to end (the unit test covers its bytes; the example sends QoS 0); the broker's limits on a will's size
 and on the retained table (the broker's `limit.will-size` and `limit.retained` refusals are not provoked by any test here); reconnect and backoff
 (slice 5).
+
+## 17. Slice 5: reconnect and backoff (design, written before the code)
+
+**Corrected in place.** Section 4 said the reconnect is part of the machine and that `step` yields a `wants.reconnect_at`. The machine as built
+(sections 13 to 16) has no `step`; the caller owns the socket, the loop and the clock, and the machine already hands back the time to the next
+`tick`. Putting a retry schedule inside it would add two fields to `Client` for a value the caller needs only while it has no connection, when
+there is no machine activity to hang it on. **Choice:** the schedule is a pure function and the caller keeps its two counters.
+
+Library, in `src/client.cho`:
+
+- `lost(c)`: the caller says the connection is gone (end of stream, a failed read or write, or `tick` answering `e_keepalive`). The machine becomes
+  closed without writing a DISCONNECT; the held messages, the packet ids and the inbox stay, because a kept session may still need them. A
+  half-read packet stays until `open` drops it (one place, so no second clear to test around). Answers the machine. Total: on a machine that is already closed it changes nothing.
+- `open` drops any half-read packet left from the previous connection (a CONNACK must not be parsed after the tail of an old packet).
+- `backoff_ms(base, ceiling, failures)`: `base` times 2 to the power `failures`, never above `ceiling`; no overflow for any `failures`.
+  `base` 1 to 60,000, `ceiling` from `base` to 3,600,000, `failures` 0 or more; anything else is `client.bad-argument`. No jitter (the library has
+  no randomness, section 4); a caller that wants it adds its own to the answer.
+- `resend` stays the caller's explicit step and is **not** made automatic: after `ev_connected` with the session kept (`a` = 1) and `inflight`
+  above 0, the caller calls it. Reason: `feed` answers events, and a library that wrote a burst of DUP packets inside `feed` would hide the
+  largest write the machine makes from the loop that has to send it; one named call is easier to bound and to test.
+
+Reconnect policy (the caller's, shown by the example): `failures` counts attempts since the last CONNACK 0; a refused or failed attempt adds 1; an
+accepted CONNACK sets it to 0; the next attempt is `backoff_ms(base, ceiling, failures)` after the failure. A CONNACK refusal that no retry can
+fix (bad protocol level, identifier, bad credentials: return codes 1, 4 and 5) is not retried by the example; 2 and 3 are.
+
+Example: `examples/watch`, a subscriber that survives its broker. It dials, opens with a persistent session, subscribes, prints messages,
+and when the connection ends waits `backoff_ms` and does it again. The example has no sleep (cancho has no builtin, and `Poller` as a sleep is
+untried, cancho's `docs/atomics.md` section 6.1), so the wait spins on `clock_ms`; the example is not for production and says so.
+
+Gates to run, each shown failing:
+
+1. Unit: `lost` keeps the held messages and the ids; a half-read packet before `lost` does not break the next connection; `backoff_ms` doubles,
+   caps, never overflows (failures up to 100,000), refuses the bad arguments; a kept session resends after `lost`, `open`, CONNACK 1 with the
+   bytes of slice 3.
+2. End to end with a real cancho-mqtt: `watch` is started before any broker exists and connects once one does; it prints a message, the broker
+   is killed and started again, and it prints the next one. (The delays themselves are not observed from outside; they are unit-tested.)
+3. Mutants of the machine and of `backoff_ms` (no cap, linear instead of doubling, off by one, a negative failure count accepted, `lost` that leaves
+   the machine open, `open` that keeps half-read bytes), all killed.
+
+Not in this slice, said now so it is not claimed later: a resend against a real broker that dropped a PUBACK (no way found to provoke the loss
+without a second program that sits between client and broker); jitter; a total retry limit.
+
+**Built (slice 5).** As designed, with these differences found on the way:
+
+- `examples/watch` writes to standard output, which cancho's `Io` buffers fully when it is not a terminal, so a `watch` killed by a signal prints
+  nothing. The end-to-end run therefore lets `watch` exit by itself (count 2) and reads its output afterwards. Each message is published retained, so
+  the run does not depend on the timing of the subscribe.
+- Mutant `lost` that clears the half-read packet **and** `open` that clears it left two survivors (each hid the other). The clear now lives in
+  `open` only.
+- Tests: `tests/client_test.cho` has 20 (2 new): `lost` keeps the session and `open` drops half a packet, then `resend` writes the held message
+  again with DUP and the next new message takes the next id; `backoff_ms` doubles, caps, never overflows (failures up to 2,000,000,000) and refuses
+  the five bad arguments.
+- End to end (`scripts/e2e.sh`, about 16 s in all): `watch` started with no broker connects when one appears, prints a retained message, survives
+  the broker being killed and started again, and prints the second. The run took 15.7 s here.
+- Mutants: 6 new variants, all killed (the four of `backoff_ms` and the two of `lost` and `open`).
+
+Not shown: the resend against a real broker that dropped a PUBACK; `watch` leaves the sleep as a spin on the clock.

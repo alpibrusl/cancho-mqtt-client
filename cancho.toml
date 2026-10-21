@@ -41,3 +41,10 @@ name = "will"
 sources = ["examples/pump.cho", "examples/will.cho", "src/codec.cho", "src/client.cho"]
 std = true
 out = "build/will"
+
+# Slice 5: a subscriber that waits and reconnects.
+[[bin]]
+name = "watch"
+sources = ["examples/pump.cho", "examples/watch.cho", "src/codec.cho", "src/client.cho"]
+std = true
+out = "build/watch"

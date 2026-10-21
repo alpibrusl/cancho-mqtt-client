@@ -1,0 +1,209 @@
+edition 5;
+
+// `watch` -- a subscriber that survives its broker: connect, subscribe to one filter, print the first <count> messages as `topic payload`
+// lines (a retained one ends with ` [retained]`), and when the connection ends or cannot be made, wait and try again.
+//
+//     watch <ipv4> <port> <filter> <count> <base-ms> <ceiling-ms>
+//
+// The wait after the n-th failure in a row is `client.backoff_ms(base, ceiling, n)`; an accepted CONNACK sets the count back to 0. A
+// CONNACK refusal no retry can fix (return codes 1, 4, 5) ends the program; 2 and 3 are retried. The machine is kept across attempts and told
+// `lost` each time, and the session is persistent, so a held message or a packet id survives a reconnect.
+//
+// Exit status: 0 <count> messages printed; 2 wrong arguments; 3 the broker refused for good. It never gives up on a broker it cannot reach.
+// The wait spins on `clock_ms` because cancho has no sleep builtin (docs/design.md section 17): fine for an example, not for production.
+// The example of `docs/design.md` section 17, slice 5; its authority row is `net_out`, `clock` and the console.
+
+import std.buffer;
+import std.io;
+import mqttc.codec;
+import mqttc.client;
+import examples.pump;
+
+fn number_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 7 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+// One connection. Answers the machine and three numbers: how the attempt ended (0 enough messages printed, 1 the connection ended or failed,
+// 2 a CONNACK refusal worth retrying, 3 a refusal for good), whether CONNACK 0 was seen, and how many messages have been printed in all.
+fn session[&h, &c, &f, &o](heap: &!h Heap, conn: &!c Conn, con: &!o Io, filter: &f [byte], want: int, printed_before: int, machine: client.Client) -> [heap, conn_read, conn_write, io_write] (client.Client, int, bool, int) {
+    let ev = box_slice(heap, 6 * 8, 0);
+    let (c1, o1, rc) = client.open(heap, machine, buffer.empty(heap, 64), "watch", 0, false, "", "", "", "", 0, 0, 0);
+    var cl = c1;
+    var out = o1;
+    var outcome = 1;
+    var accepted = false;
+    var printed = printed_before;
+    var running = true;
+    if rc != 0 {
+        outcome = 3;
+        running = false;
+    }
+    if running {
+        let (o2, sent) = pump.send_out(conn, out);
+        out = o2;
+        if !sent {
+            running = false;
+        }
+    }
+    while running {
+        borrow mut ev as &!ew in {
+            let (c2, o3, n, s) = pump.pump(heap, conn, cl, 0, contents(ew), out);
+            cl = c2;
+            out = o3;
+            if s != 0 {
+                running = false;
+            }
+            var k = 0;
+            while k < n && running {
+                let e = contents(ew);
+                let kind = e[6 * k];
+                if kind == client.ev_connected() {
+                    accepted = true;
+                    // The session may be one the broker kept: send again what was never acknowledged, then subscribe (idempotent).
+                    let (c3, o4, again) = client.resend(heap, cl, out, 0);
+                    cl = c3;
+                    out = o4;
+                    region a {
+                        let table = alloc_slice[a](3, 0);
+                        table[1] = len(filter);
+                        let (c4, o5, pid) = client.subscribe(heap, cl, out, filter, table, 1, 0);
+                        cl = c4;
+                        out = o5;
+                        if pid < 0 {
+                            outcome = 3;
+                            running = false;
+                        }
+                    }
+                    let (o6, sent2) = pump.send_out(conn, out);
+                    out = o6;
+                    if !sent2 {
+                        running = false;
+                    }
+                } else if kind == client.ev_message() {
+                    borrow cl as &cr in {
+                        let box = client.inbox(cr);
+                        io.write_all(con, box[e[6 * k + 1]..e[6 * k + 1] + e[6 * k + 2]]);
+                        io.write_all(con, " ");
+                        io.write_all(con, box[e[6 * k + 3]..e[6 * k + 3] + e[6 * k + 4]]);
+                        if e[6 * k + 5] / 4 == 1 {
+                            io.write_all(con, " [retained]");
+                        }
+                        io.write_all(con, "\n");
+                    }
+                    printed = printed + 1;
+                    if printed >= want {
+                        outcome = 0;
+                        running = false;
+                    }
+                } else if kind == client.ev_connack_refused() {
+                    outcome = 3;
+                    if e[6 * k + 1] == 2 || e[6 * k + 1] == 3 {
+                        outcome = 2;
+                    }
+                    running = false;
+                } else if kind == client.ev_refused() {
+                    outcome = 1;
+                    running = false;
+                }
+                k = k + 1;
+            }
+            borrow mut cl as &!cw in {
+                client.clear_inbox(cw);
+            }
+        }
+    }
+    if outcome == 0 {
+        let (c5, o7, r2) = client.disconnect(heap, cl, out, 0);
+        cl = c5;
+        out = o7;
+        let (o8, sent3) = pump.send_out(conn, out);
+        out = o8;
+    }
+    // Whatever way it ended, the machine is told: a closed machine can be opened again.
+    cl = client.lost(cl);
+    buffer.drop(heap, out);
+    unbox_slice(heap, ev);
+    return (cl, outcome, accepted, printed);
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(fs);
+    var status = 2;
+    borrow args as &g in {
+        if arg_count(g) >= 7 {
+            let port = number_of(arg(g, 2));
+            let want = number_of(arg(g, 4));
+            let base = number_of(arg(g, 5));
+            let ceiling = number_of(arg(g, 6));
+            if port > 0 && port < 65536 && want > 0 && client.backoff_ms(base, ceiling, 0) > 0 {
+                status = 0 - 1;
+                var failures = 0;
+                var printed = 0;
+                borrow mut heap as &!h in {
+                    borrow mut io as &!i in {
+                        borrow net as &nn in {
+                            borrow clock as &kk in {
+                                var machine = client.new(h, 65536);
+                                while status == 0 - 1 {
+                                    match tcp_connect(nn, arg(g, 1), port) {
+                                        Dialed::Ok(cn) => {
+                                            var conn = cn;
+                                            borrow mut conn as &!ch in {
+                                                let (m2, outcome, accepted, total) = session(h, ch, i, arg(g, 3), want, printed, machine);
+                                                machine = m2;
+                                                printed = total;
+                                                if accepted {
+                                                    failures = 0;
+                                                }
+                                                if outcome == 0 {
+                                                    status = 0;
+                                                } else if outcome == 3 {
+                                                    status = 3;
+                                                }
+                                            }
+                                            conn_close(conn);
+                                        }
+                                        Dialed::Failed(e) => {
+                                            status = 0 - 1;
+                                        }
+                                    }
+                                    if status == 0 - 1 {
+                                        let wait = client.backoff_ms(base, ceiling, failures);
+                                        failures = failures + 1;
+                                        let until = clock_ms(kk) + wait;
+                                        var t = clock_ms(kk);
+                                        while t < until {
+                                            t = clock_ms(kk);
+                                        }
+                                    }
+                                }
+                                client.drop(h, machine);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(args);
+    release(io);
+    release(clock);
+    release(heap);
+    return status;
+}

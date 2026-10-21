@@ -57,6 +57,12 @@ CLIENT_MUTANTS = {
     "client-will-retain-dropped": ("the will's retain flag is not sent", "will_topic, will_message, will_qos, will_retain);\n        if n < 0 {", "will_topic, will_message, will_qos, 0);\n        if n < 0 {"),
     "client-publish-retain-dropped": ("publish does not send the retain flag", "codec.put_publish(packet, 0, topic, payload, qos, retain, 0, pid)", "codec.put_publish(packet, 0, topic, payload, qos, 0, 0, pid)"),
     "client-incoming-retain-unreported": ("an incoming retained message is reported as live", "t[5] + 4 * t[6]);", "t[5]);"),
+    "client-backoff-uncapped": ("backoff_ms may answer above the ceiling", "    if d > ceiling {\n        return ceiling;\n    }\n    return d;", "    return d;"),
+    "client-backoff-linear": ("backoff_ms adds the base instead of doubling", "        d = d * 2;", "        d = d + base;"),
+    "client-backoff-off-by-one": ("backoff_ms doubles once too often", "    while n < failures && d < ceiling {", "    while n <= failures && d < ceiling {"),
+    "client-backoff-negative-failures": ("backoff_ms accepts a negative failure count", " || ceiling > max_backoff_ceiling_ms() || failures < 0 {", " || ceiling > max_backoff_ceiling_ms() {"),
+    "client-lost-stays-open": ("lost leaves the machine connected", "    return Client { rx: rx, inbox: inbox, state: 0, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1,", "    return Client { rx: rx, inbox: inbox, state: state, keepalive_ms: keepalive_ms, max_packet: max_packet, last_sent: last_sent, ping_sent: 0 - 1,"),
+    "client-open-keeps-half-a-packet": ("open keeps the bytes of the last connection's half-read packet", "    var fresh_rx = rx;\n    borrow mut fresh_rx as &!rw in {\n        buffer.clear(rw);\n    }", "    var fresh_rx = rx;\n    borrow mut fresh_rx as &!rw in {\n        buffer.size(rw);\n    }"),
     "client-packet-id-not-fresh": ("a new QoS 1 message may take the id of a held one", "        pid0 = fresh(cr0, cr0.next_pid);\n        held_n = held_count(cr0.held);", "        pid0 = cr0.next_pid;\n        held_n = held_count(cr0.held);"),
 }
 
