@@ -76,6 +76,16 @@ pub fn e_keepalive() -> [] int {
     return 0 - 18;
 }
 
+// As many QoS 1 messages in flight as the window allows.
+pub fn e_window() -> [] int {
+    return 0 - 19;
+}
+
+// The unacknowledged QoS 1 messages would pass the bytes the machine keeps.
+pub fn e_queue_full() -> [] int {
+    return 0 - 20;
+}
+
 // The rule tag of a refusal code (design section 6); "client.unknown" for a code that is none.
 pub fn tag_of(code: int) -> [] &static [byte] {
     if code == 0 - 2 || code == 0 - 10 {
@@ -107,6 +117,12 @@ pub fn tag_of(code: int) -> [] &static [byte] {
     }
     if code == 0 - 18 {
         return "client.keepalive-timeout";
+    }
+    if code == 0 - 19 {
+        return "client.window-full";
+    }
+    if code == 0 - 20 {
+        return "client.queue-full";
     }
     return "client.unknown";
 }

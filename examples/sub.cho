@@ -1,6 +1,6 @@
 edition 5;
 
-// `sub` -- connect to a broker, subscribe to one filter at QoS 0, print the first <count> messages as `topic payload` lines, disconnect.
+// `sub` -- connect to a broker, subscribe to one filter at QoS 0, print the first <count> messages as `topic payload` lines (a retained one, which the broker had kept, ends with ` [retained]`), disconnect.
 //
 //     sub <ipv4> <port> <filter> <count> [<client-id>]
 //
@@ -89,6 +89,9 @@ fn run[&h, &c, &f, &i, &o](heap: &!h Heap, conn: &!c Conn, con: &!o Io, filter: 
                         io.write_all(con, box[e[6 * k + 1]..e[6 * k + 1] + e[6 * k + 2]]);
                         io.write_all(con, " ");
                         io.write_all(con, box[e[6 * k + 3]..e[6 * k + 3] + e[6 * k + 4]]);
+                        if e[6 * k + 5] / 4 == 1 {
+                            io.write_all(con, " [retained]");
+                        }
                         io.write_all(con, "\n");
                     }
                     printed = printed + 1;

@@ -8,8 +8,9 @@ end-to-end run against a real broker (scripts/e2e.sh) also counts, and must itse
 
 `../cancho-mqtt` must be a checkout of cancho-mqtt (design section 9, gate 1).
 """
-import shutil
 import os
+import shutil
+import signal
 import pathlib
 import subprocess
 import sys
@@ -41,10 +42,22 @@ CLIENT_MUTANTS = {
     "client-second-connack-accepted": ("a second CONNACK is accepted", "                    if st == 2 && k == 2 {", "                    if st == 7 && k == 2 {"),
     "client-alive-not-noticed": ("a packet from the broker does not clear the outstanding ping", "                    ping = 0 - 1;\n", "                    ping = ping;\n"),
     "client-grace-ignored": ("the keep-alive grace is zero: the broker is declared silent at once", "    if keepalive_ms / 2 < 1000 {\n        return 1000;\n    }\n    return keepalive_ms / 2;", "    return 0;"),
-    "client-pid-not-advanced": ("every SUBSCRIBE reuses one packet id", "next_pid: bump(next_pid) }, appended, pid);", "next_pid: next_pid }, appended, pid);"),
+    "client-pid-not-advanced": ("every SUBSCRIBE reuses one packet id", "next_pid: bump(next_pid), held: held }, appended, pid);", "next_pid: next_pid, held: held }, appended, pid);"),
     "client-message-offsets-wrong": ("the payload offset of a message points at the topic", "ne = emit(events, ne, ev_message(), at, t[1], at + t[1], t[4], t[5] + 4 * t[6]);", "ne = emit(events, ne, ev_message(), at, t[1], at, t[4], t[5] + 4 * t[6]);"),
     "client-ping-never-sent": ("the keep-alive never sends a PINGREQ", "    let due = last_sent + keepalive_ms;\n    if now >= due {", "    let due = last_sent + keepalive_ms;\n    if now >= due + 1000000000 {"),
-    "client-publish-before-connack": ("publish is allowed before CONNACK", "    if st0 != 2 {\n        return (c, out, codec.e_state());\n    }\n    if qos != 0 {", "    if st0 != 2 && st0 != 1 {\n        return (c, out, codec.e_state());\n    }\n    if qos != 0 {"),
+    "client-publish-before-connack": ("publish is allowed before CONNACK", "    if st0 != 2 {\n        return (c, out, codec.e_state());\n    }\n    if qos == 2 {", "    if st0 != 2 && st0 != 1 {\n        return (c, out, codec.e_state());\n    }\n    if qos == 2 {"),
+    "client-ack-does-not-free": ("a PUBACK does not free the held message", "                if id == pid {\n                    found = true;", "                if id == 0 - 1 {\n                    found = true;"),
+    "client-window-ignored": ("the in-flight window is not enforced", "    if qos == 1 && held_n >= win {", "    if qos == 1 && held_n >= win + 1000 {"),
+    "client-held-bytes-unbounded": ("the held bytes are not bounded", "    if qos == 1 && held_b + size > max_held_bytes() {", "    if qos == 1 && held_b + size > 999999999 {"),
+    "client-resend-without-dup": ("a resent message does not carry DUP", "again[0] = byte_of(int_of(again[0]) | 8);", "again[0] = byte_of(int_of(again[0]) | 0);"),
+    "client-clean-session-keeps-held": ("a clean session keeps what was held", "        if clean_session {\n            kept = held_clear(heap, kept);", "        if clean_session && 1 == 2 {\n            kept = held_clear(heap, kept);"),
+    "client-lost-session-keeps-held": ("a broker without our session leaves what was held in place", "                                        if contents(cw)[0] == 0 {\n                                            hd = held_clear(heap, hd);", "                                        if contents(cw)[0] == 7 {\n                                            hd = held_clear(heap, hd);"),
+    "client-stray-puback-counts": ("a PUBACK that names nothing held is reported as matched", "                                        if was {\n                                            matched = 1;", "                                        if was || 1 == 1 {\n                                            matched = 1;"),
+    "client-will-dropped": ("open does not send the will it was given", "will_topic, will_message, will_qos, will_retain);\n        if n < 0 {", "\"\", \"\", 0, 0);\n        if n < 0 {"),
+    "client-will-retain-dropped": ("the will's retain flag is not sent", "will_topic, will_message, will_qos, will_retain);\n        if n < 0 {", "will_topic, will_message, will_qos, 0);\n        if n < 0 {"),
+    "client-publish-retain-dropped": ("publish does not send the retain flag", "codec.put_publish(packet, 0, topic, payload, qos, retain, 0, pid)", "codec.put_publish(packet, 0, topic, payload, qos, 0, 0, pid)"),
+    "client-incoming-retain-unreported": ("an incoming retained message is reported as live", "t[5] + 4 * t[6]);", "t[5]);"),
+    "client-packet-id-not-fresh": ("a new QoS 1 message may take the id of a held one", "        pid0 = fresh(cr0, cr0.next_pid);\n        held_n = held_count(cr0.held);", "        pid0 = cr0.next_pid;\n        held_n = held_count(cr0.held);"),
 }
 
 # Variants that cannot be killed because they change no behaviour, each with the reason (they are run and must survive, so a reason
@@ -74,9 +87,15 @@ def run(source_text, client_text=None):
             shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(".git", "build"))
             (tree / "src" / "codec.cho").write_text(source_text)
             (tree / "src" / "client.cho").write_text(client.read_text())
-            r = subprocess.run(["bash", str(tree / "scripts" / "e2e.sh"), "18890"], capture_output=True, text=True)
-            if r.returncode != 0:
-                failed.append("e2e")
+            # A broken client can wait forever for an acknowledgement, so the script gets a deadline and its whole process group is stopped.
+            proc = subprocess.Popen(["bash", str(tree / "scripts" / "e2e.sh"), "18890"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                if proc.wait(timeout=60) != 0:
+                    failed.append("e2e")
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                failed.append("e2e (timed out)")
         return failed
 
 
@@ -92,6 +111,9 @@ def main():
     survivors = []
     base_client = (ROOT / "src" / "client.cho").read_text()
     everything = [(n, w, o, nw, False) for n, (w, o, nw) in MUTANTS.items()] + [(n, w, o, nw, True) for n, (w, o, nw) in CLIENT_MUTANTS.items()]
+    if "--after" in sys.argv:
+        names = [e[0] for e in everything]
+        everything = everything[names.index(sys.argv[sys.argv.index("--after") + 1]) + 1:]
     for name, what, old, new, in_client in everything:
         text = base_client if in_client else base
         if text.count(old) != 1:

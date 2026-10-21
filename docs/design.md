@@ -1,6 +1,6 @@
 # cancho-mqtt-client: design
 
-> **Status: slices 1 and 2 built (the codec; the state machine for connect, QoS 0 publish, subscribe, ping, disconnect, with two example programs).** Claims are read from a named file, measured (with the command), or
+> **Status: slices 1 to 3 built (the codec; the state machine for connect, QoS 0 and QoS 1 publish, subscribe, ping, disconnect, with two example programs).** Claims are read from a named file, measured (with the command), or
 > marked **choice** or **open**. Section 11 says what is built; section 10 says which probes are answered. A claim found false is
 > corrected in place and marked *(corrected)*.
 
@@ -79,7 +79,7 @@ Every bound is a field of a `Config` with a compiled-in default and a hard ceili
 | max packet size in | 16 KiB | `client.packet-too-large` |
 | max topic length | 256 | `client.topic-too-long` |
 | in-flight QoS 1 publishes | 16 | `client.window-full` (the caller retries after an `Acked`) |
-| queued outgoing bytes while disconnected | 64 KiB | `client.queue-full` |
+| held (unacknowledged QoS 1) bytes | 64 KiB | `client.queue-full` *(corrected in slice 3: it is the unacknowledged messages that are kept, not a queue of unsent ones; a publish needs a connected machine)* |
 | subscriptions per call | 16 | `client.too-many-filters` |
 
 The state is a fixed-size structure sized from the `Config` at construction, in the style of the broker (which prints its own
@@ -166,7 +166,7 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 
 (1) the codec and its gates 1 and 2, no state machine **(built: `src/codec.cho`)**; (2) the state machine: connect, publish QoS 0,
 subscribe, ping, with `pub`/`sub` **(built: `src/client.cho`, `examples/`; see section 14)**;
-(3) QoS 1 and the window; (4) will and retained; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
+(3) QoS 1 and the window **(built; see section 15)**; (4) will and retained **(built; see section 16)**; (5) reconnect and backoff; (6) the package store and its check; (7) the platform's
 ingest and simulator (in cancho-industrial, not here).
 
 ## 12. Open questions for the owner
@@ -217,3 +217,60 @@ it grow without bound. A cap on the inbox, and `memory_bytes`, are the open item
 
 Found while building it: the examples' reads block, so the keep-alive cannot fire while they wait; they set no keep-alive. A program with a
 loop of its own (a `Poller`, as the platform's ingest will have) calls `tick` and waits at most what it answers.
+
+## 15. What slice 3 built, and what it did not
+
+Built, in `src/client.cho`:
+
+- `publish` at QoS 1 answers the packet id (1 to 65535) and holds the packet until its PUBACK. A packet id skips any id a held message still uses
+  (2.3.1), including when the ids wrap. Refusals: `client.window-full` (default window 16, `set_window` 1 to 256), `client.queue-full` (the held
+  bytes would pass 65,536), `client.qos2-unsupported`, `client.not-connected`.
+- A PUBACK frees the held message it names and is reported as `ev_acked` with `b` = 1; one that names nothing held is reported with `b` = 0 and ignored.
+- `inflight` says how many are held. `resend` writes every held message again with DUP set, in the order first sent.
+- Sessions: `open` with a clean session discards what was held (3.1.2.4); a CONNACK that says session present 0 discards it too (3.2.2.2); a kept
+  session keeps it.
+- `examples/pub` takes a QoS; at 1 it waits for the broker's PUBACK before it disconnects.
+
+**Corrected in place.** The sketch for this slice said "QoS 1 and the window ... retries". MQTT 3.1.1 (4.4) allows a client to send an
+unacknowledged PUBLISH again only after the connection was re-established; resending on a timer over a live connection is not allowed. So there is no
+retry timer. The held messages and `resend` are the mechanism; calling `resend` after a reconnect with a kept session is the reconnect policy of slice 5.
+
+Run here (the tests need no broker; the end-to-end run needs one):
+
+- `tests/client_test.cho`: 16 tests (5 new): the QoS 1 bytes and ids, PUBACK freeing and the stray PUBACK, the window and the held-bytes bound (eight 8,000-byte
+  messages fit, the ninth does not), `resend` with DUP, the three session cases, and 65,535 ids with one held under id 1 (the next id is 2). The random
+  sweep now publishes at QoS 1 and feeds PUBACKs.
+- `scripts/e2e.sh`: against a real cancho-mqtt, `pub` at QoS 1 returned after the PUBACK, and `sub` printed the message.
+- `scripts/mutants.py`: 8 new variants of the machine (a PUBACK that does not free, the window ignored, the bound ignored, no DUP on resend, a clean session
+  that keeps what was held, a lost session that keeps it, a stray PUBACK counted as matched, an id that may take a held one), all killed.
+
+Not built: QoS 2 (a received QoS 2 PUBLISH is still refused); an automatic resend after a reconnect (slice 5); persistence of the held messages across a
+restart of the program (they live in the machine); the memory figure of section 5. The held bytes are bounded now; the inbox still is not
+(section 14).
+
+## 16. What slice 4 built, and what it did not
+
+**A finding first.** The sketch for this slice listed "will and retained handling" as new code. It is not: the library already carried both, from
+slice 1 (`put_connect` takes the will and its QoS and retain flag; `put_publish` takes `retain`; an incoming PUBLISH reports `qos + 4 * retain` in
+`ev_message`) and slice 2 (`open` and `publish` pass them through). What was missing was every check that they work in the machine and against a
+real broker, and a way to use them from the examples. The slice is that, and no library code changed.
+
+Built:
+
+- `tests/client_test.cho`: 18 tests (2 new). `test_will_rides_in_connect`: six refusals (will QoS 2, QoS 3, a retain flag of 2, a wildcard topic, a
+  message without a topic, a retain flag without a topic) each leave the machine closed and write nothing; then the exact CONNECT bytes for a QoS 1
+  retained will (connect flags `0x2E`) and for an empty message at QoS 0. `test_retain_flag_both_ways`: the first byte of PUBLISH at QoS 0 and 1 with
+  and without retain, a retain flag of 2 or -1 refused with nothing written, an empty retained payload (the way to clear one, 3.3.1-10), and an
+  incoming retained and live PUBLISH reported as 4 and 0.
+- `examples/pub` takes a retain argument; `examples/sub` ends a retained message's line with ` [retained]`; new `examples/will` connects with a
+  will and ends either by dropping the socket or by sending DISCONNECT.
+- `scripts/e2e.sh`, against a real cancho-mqtt: a live subscriber sees a retained message unmarked and a late one sees it marked; an empty retained
+  message clears it; a will is published when the socket drops, is not published after DISCONNECT, and a retained will is kept for a late
+  subscriber. The run took about 9 s, mostly its own waits.
+- `scripts/mutants.py`: 4 new variants of the machine (the will not sent, its retain flag not sent, the retain flag of PUBLISH not sent, an
+  incoming retained message reported as live), all killed, each by the unit tests and by the end-to-end run.
+
+Not built, and not claimed: will and retained behaviour against a second broker (Mosquitto is not installed here; section 9 still lists it as
+gate 3's other half); a will at QoS 1 end to end (the unit test covers its bytes; the example sends QoS 0); the broker's limits on a will's size
+and on the retained table (the broker's `limit.will-size` and `limit.retained` refusals are not provoked by any test here); reconnect and backoff
+(slice 5).

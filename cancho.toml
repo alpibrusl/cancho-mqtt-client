@@ -34,3 +34,10 @@ name = "sub"
 sources = ["examples/pump.cho", "examples/sub.cho", "src/codec.cho", "src/client.cho"]
 std = true
 out = "build/sub"
+
+# Slice 4: a connection that carries a will and ends two ways.
+[[bin]]
+name = "will"
+sources = ["examples/pump.cho", "examples/will.cho", "src/codec.cho", "src/client.cho"]
+std = true
+out = "build/will"
