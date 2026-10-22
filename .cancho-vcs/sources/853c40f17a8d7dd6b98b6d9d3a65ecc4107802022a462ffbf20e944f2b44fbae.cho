@@ -1,0 +1,815 @@
+edition 5;
+
+// `mqttc.codec` -- the MQTT 3.1.1 packet codec of the client (design section 1, 6 and 7).
+//
+// It is the inverse of cancho-mqtt's `mqtt.wire`: what that decodes (CONNECT, SUBSCRIBE, ...) this encodes, what that
+// encodes (CONNACK, SUBACK, ...) this decodes. It is written independently so that a differential test can make the two disagree
+// (design section 7, gate 1).
+//
+// Everything here is total: no input reaches a trap. Every read is preceded by a bounds check that answers a negative code, and every
+// code is a rule of design section 6 (`tag_of` turns it into the tag). Decoders fill an `int` table the caller owns, with offsets into
+// the packet, so no byte is copied to be parsed; encoders write into a caller's slice at an offset and answer the new offset, or -1
+// when the packet does not fit, or one of the refusal codes when an argument breaks a rule.
+
+module mqttc.codec;
+
+import std.utf8;
+
+// ---- codes ---------------------------------------------------------------
+
+// `header`: not enough bytes yet.
+pub fn incomplete() -> [] int {
+    return 0 - 1;
+}
+
+// `header`: a remaining length that is not a valid one (more than four bytes, or a longer encoding than the value needs).
+pub fn bad_length() -> [] int {
+    return 0 - 2;
+}
+
+// `header`: the packet is longer than the bound.
+pub fn too_large() -> [] int {
+    return 0 - 3;
+}
+
+// Encoders: the packet does not fit in the slice.
+pub fn no_room() -> [] int {
+    return 0 - 1;
+}
+
+// Decoders and encoders: 0 (or an offset) is success; these are the refusals.
+pub fn e_malformed() -> [] int {
+    return 0 - 10;
+}
+
+pub fn e_unexpected() -> [] int {
+    return 0 - 11;
+}
+
+pub fn e_topic() -> [] int {
+    return 0 - 12;
+}
+
+pub fn e_packet_id() -> [] int {
+    return 0 - 13;
+}
+
+pub fn e_qos2() -> [] int {
+    return 0 - 14;
+}
+
+pub fn e_argument() -> [] int {
+    return 0 - 15;
+}
+
+pub fn e_filters() -> [] int {
+    return 0 - 16;
+}
+
+// The client is not in the state an operation needs (a publish before CONNACK).
+pub fn e_state() -> [] int {
+    return 0 - 17;
+}
+
+// No packet from the broker within the keep-alive and its grace (design section 6).
+pub fn e_keepalive() -> [] int {
+    return 0 - 18;
+}
+
+// As many QoS 1 messages in flight as the window allows.
+pub fn e_window() -> [] int {
+    return 0 - 19;
+}
+
+// The unacknowledged QoS 1 messages would pass the bytes the machine keeps.
+pub fn e_queue_full() -> [] int {
+    return 0 - 20;
+}
+
+// The rule tag of a refusal code (design section 6); "client.unknown" for a code that is none.
+pub fn tag_of(code: int) -> [] &static [byte] {
+    if code == 0 - 2 || code == 0 - 10 {
+        return "client.malformed";
+    }
+    if code == 0 - 3 {
+        return "client.packet-too-large";
+    }
+    if code == 0 - 11 {
+        return "client.unexpected-packet";
+    }
+    if code == 0 - 12 {
+        return "client.bad-topic";
+    }
+    if code == 0 - 13 {
+        return "client.bad-packet-id";
+    }
+    if code == 0 - 14 {
+        return "client.qos2-unsupported";
+    }
+    if code == 0 - 15 {
+        return "client.bad-argument";
+    }
+    if code == 0 - 16 {
+        return "client.too-many-filters";
+    }
+    if code == 0 - 17 {
+        return "client.not-connected";
+    }
+    if code == 0 - 18 {
+        return "client.keepalive-timeout";
+    }
+    if code == 0 - 19 {
+        return "client.window-full";
+    }
+    if code == 0 - 20 {
+        return "client.queue-full";
+    }
+    return "client.unknown";
+}
+
+// ---- packet types --------------------------------------------------------
+
+pub fn t_connect() -> [] int {
+    return 1;
+}
+
+pub fn t_connack() -> [] int {
+    return 2;
+}
+
+pub fn t_publish() -> [] int {
+    return 3;
+}
+
+pub fn t_puback() -> [] int {
+    return 4;
+}
+
+pub fn t_pubrec() -> [] int {
+    return 5;
+}
+
+pub fn t_pubrel() -> [] int {
+    return 6;
+}
+
+pub fn t_pubcomp() -> [] int {
+    return 7;
+}
+
+pub fn t_subscribe() -> [] int {
+    return 8;
+}
+
+pub fn t_suback() -> [] int {
+    return 9;
+}
+
+pub fn t_unsubscribe() -> [] int {
+    return 10;
+}
+
+pub fn t_unsuback() -> [] int {
+    return 11;
+}
+
+pub fn t_pingreq() -> [] int {
+    return 12;
+}
+
+pub fn t_pingresp() -> [] int {
+    return 13;
+}
+
+pub fn t_disconnect() -> [] int {
+    return 14;
+}
+
+// How many filters one SUBSCRIBE or UNSUBSCRIBE this client writes (and one SUBACK it reads) may carry (design section 5).
+pub fn max_filters() -> [] int {
+    return 16;
+}
+
+// Longest string any packet field may hold (a 16-bit length).
+pub fn string_limit() -> [] int {
+    return 65535;
+}
+
+// ---- the fixed header ----------------------------------------------------
+
+// The fixed header of the packet at the front of `data`: `total`, the whole packet's length (header included), or one of
+// `incomplete`, `bad_length`, `too_large` (`max` is the largest packet accepted).
+pub fn header[&d](data: &d [byte], max: int) -> [] int {
+    if len(data) < 2 {
+        return incomplete();
+    }
+    var value = 0;
+    var mult = 1;
+    var i = 1;
+    var going = true;
+    var last = 0;
+    while going {
+        if i >= len(data) {
+            return incomplete();
+        }
+        let b = int_of(data[i]);
+        value = value + (b & 127) * mult;
+        last = b;
+        i = i + 1;
+        if b & 128 == 0 {
+            going = false;
+        } else if i >= 5 {
+            return bad_length();
+        } else {
+            mult = mult * 128;
+        }
+    }
+    // The shortest encoding: a multi-byte length may not end in a zero byte.
+    if i > 2 && last == 0 {
+        return bad_length();
+    }
+    let total = i + value;
+    if total > max {
+        return too_large();
+    }
+    return total;
+}
+
+// Bytes before the body. Only meaningful after `header` answered a total.
+pub fn header_size[&d](data: &d [byte]) -> [] int {
+    var i = 1;
+    while i < len(data) && i < 5 && int_of(data[i]) & 128 != 0 {
+        i = i + 1;
+    }
+    return i + 1;
+}
+
+pub fn kind[&d](data: &d [byte]) -> [] int {
+    if len(data) < 1 {
+        return 0;
+    }
+    return int_of(data[0]) >> 4;
+}
+
+pub fn flags[&d](data: &d [byte]) -> [] int {
+    if len(data) < 1 {
+        return 0;
+    }
+    return int_of(data[0]) & 15;
+}
+
+// What a client may receive, by type: 0 if it is allowed, else the refusal. The flags a type requires are checked here too.
+pub fn check_kind(k: int, f: int) -> [] int {
+    if k == 2 || k == 4 || k == 9 || k == 11 || k == 13 {
+        if f != 0 {
+            return e_malformed();
+        }
+        return 0;
+    }
+    if k == 3 {
+        return 0;
+    }
+    // QoS 2 packets: this client does not speak them (design section 1).
+    if k == 5 || k == 6 || k == 7 {
+        return e_qos2();
+    }
+    // A broker never sends these.
+    if k == 1 || k == 8 || k == 10 || k == 12 || k == 14 {
+        return e_unexpected();
+    }
+    // Types 0 and 15 are reserved.
+    return e_malformed();
+}
+
+// ---- reading fields ------------------------------------------------------
+
+// The big-endian 16-bit value at `at`, or -1 if there are not two bytes before `end`.
+fn be16[&d](data: &d [byte], at: int, end: int) -> [] int {
+    if at < 0 || at + 2 > end {
+        return 0 - 1;
+    }
+    return int_of(data[at]) << 8 | int_of(data[at + 1]);
+}
+
+// Is `data[at..at+n]` valid MQTT UTF-8: well formed, and with no U+0000 (1.5.3).
+fn clean[&d](data: &d [byte], at: int, n: int) -> [] bool {
+    var i = at;
+    while i < at + n {
+        if int_of(data[i]) == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return utf8.is_valid(data[at..at + n]);
+}
+
+// Does `text` hold a wildcard character?
+fn has_wildcard[&d](text: &d [byte]) -> [] bool {
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c == 35 || c == 43 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// A topic name (publish): not empty, no wildcard, clean UTF-8, at most `string_limit` bytes.
+pub fn valid_name[&d](name: &d [byte]) -> [] bool {
+    if len(name) == 0 || len(name) > string_limit() || has_wildcard(name) {
+        return false;
+    }
+    return clean(name, 0, len(name));
+}
+
+// A topic filter (subscribe): not empty, clean UTF-8, `+` alone in its level, `#` alone and last (4.7.1).
+pub fn valid_filter[&d](filter: &d [byte]) -> [] bool {
+    if len(filter) == 0 || len(filter) > string_limit() || !clean(filter, 0, len(filter)) {
+        return false;
+    }
+    var level_start = 0;
+    var i = 0;
+    while i <= len(filter) {
+        let at_end = i == len(filter);
+        if at_end || int_of(filter[i]) == 47 {
+            // The level is filter[level_start..i].
+            let n = i - level_start;
+            var j = level_start;
+            while j < i {
+                let c = int_of(filter[j]);
+                if c == 43 && n != 1 {
+                    return false;
+                }
+                if c == 35 && (n != 1 || !at_end) {
+                    return false;
+                }
+                j = j + 1;
+            }
+            level_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- CONNACK -------------------------------------------------------------
+
+// Slots of a decoded CONNACK: `t[0]` the session-present flag, `t[1]` the return code (0 accepted, 1 to 5 refused).
+pub fn connack_slots() -> [] int {
+    return 2;
+}
+
+pub fn decode_connack[&d, &t](data: &d [byte], t: &!t [int]) -> [] int {
+    let p = header_size(data);
+    // The body is exactly two bytes: the acknowledge flags and the return code.
+    if len(data) != p + 2 || len(t) < connack_slots() {
+        return e_malformed();
+    }
+    let ack = int_of(data[p]);
+    let code = int_of(data[p + 1]);
+    // 3.2.2.1: bits 7 to 1 are reserved; 3.2.2.3: the return codes are 0 to 5.
+    if ack > 1 || code > 5 {
+        return e_malformed();
+    }
+    // 3.2.2.4: a refused connection has no session present.
+    if code != 0 && ack != 0 {
+        return e_malformed();
+    }
+    t[0] = ack;
+    t[1] = code;
+    return 0;
+}
+
+// ---- PUBLISH -------------------------------------------------------------
+
+pub fn p_topic() -> [] int {
+    return 0;
+}
+
+pub fn p_topic_len() -> [] int {
+    return 1;
+}
+
+pub fn p_pid() -> [] int {
+    return 2;
+}
+
+pub fn p_payload() -> [] int {
+    return 3;
+}
+
+pub fn p_payload_len() -> [] int {
+    return 4;
+}
+
+pub fn p_qos() -> [] int {
+    return 5;
+}
+
+pub fn p_retain() -> [] int {
+    return 6;
+}
+
+pub fn p_dup() -> [] int {
+    return 7;
+}
+
+pub fn publish_slots() -> [] int {
+    return 8;
+}
+
+// Decode a PUBLISH a broker sent. QoS 2 is `e_qos2`; QoS 3 is malformed (3.3.1-4).
+pub fn decode_publish[&d, &t](data: &d [byte], t: &!t [int]) -> [] int {
+    let end = len(data);
+    if len(t) < publish_slots() {
+        return e_malformed();
+    }
+    let fl = flags(data);
+    let qos = fl >> 1 & 3;
+    let dup = fl >> 3 & 1;
+    let retain = fl & 1;
+    t[5] = qos;
+    t[6] = retain;
+    t[7] = dup;
+    if qos == 3 {
+        return e_malformed();
+    }
+    if qos == 2 {
+        return e_qos2();
+    }
+    // [MQTT-3.3.1-2] DUP is zero on a QoS 0 message.
+    if qos == 0 && dup == 1 {
+        return e_malformed();
+    }
+    var p = header_size(data);
+    let tl = be16(data, p, end);
+    if tl < 0 {
+        return e_malformed();
+    }
+    p = p + 2;
+    if p + tl > end {
+        return e_malformed();
+    }
+    // A broker's topic name has no wildcard (3.3.2-2) and is clean UTF-8.
+    if tl == 0 || !clean(data, p, tl) || has_wildcard(data[p..p + tl]) {
+        return e_topic();
+    }
+    t[0] = p;
+    t[1] = tl;
+    p = p + tl;
+    t[2] = 0;
+    if qos > 0 {
+        let pid = be16(data, p, end);
+        if pid < 0 {
+            return e_malformed();
+        }
+        if pid == 0 {
+            return e_packet_id();
+        }
+        t[2] = pid;
+        p = p + 2;
+    }
+    t[3] = p;
+    t[4] = end - p;
+    return 0;
+}
+
+// ---- PUBACK, UNSUBACK, PINGRESP ------------------------------------------
+
+// The packet id of a PUBACK or an UNSUBACK (a two-byte body holding only the identifier), or the refusal.
+pub fn decode_pid[&d](data: &d [byte]) -> [] int {
+    let p = header_size(data);
+    if len(data) != p + 2 {
+        return e_malformed();
+    }
+    let pid = be16(data, p, len(data));
+    if pid <= 0 {
+        return e_packet_id();
+    }
+    return pid;
+}
+
+// A packet with no body: PINGRESP.
+pub fn decode_empty[&d](data: &d [byte]) -> [] int {
+    if len(data) != 2 {
+        return e_malformed();
+    }
+    return 0;
+}
+
+// ---- SUBACK --------------------------------------------------------------
+
+// `t[0]` is the packet id, `t[1]` how many return codes, then `t[2 + k]` is the code of filter k (0, 1, 2 or 128).
+pub fn suback_slots() -> [] int {
+    return 2 + max_filters();
+}
+
+pub fn decode_suback[&d, &t](data: &d [byte], t: &!t [int]) -> [] int {
+    let end = len(data);
+    let p = header_size(data);
+    if len(t) < suback_slots() {
+        return e_malformed();
+    }
+    let pid = be16(data, p, end);
+    if pid < 0 {
+        return e_malformed();
+    }
+    if pid == 0 {
+        return e_packet_id();
+    }
+    let n = end - (p + 2);
+    if n < 1 {
+        return e_malformed();
+    }
+    if n > max_filters() {
+        return e_filters();
+    }
+    var k = 0;
+    while k < n {
+        let c = int_of(data[p + 2 + k]);
+        // 3.9.3: 0, 1 and 2 are the granted QoS, 128 a failure; the rest are reserved.
+        if c != 0 && c != 1 && c != 2 && c != 128 {
+            return e_malformed();
+        }
+        t[2 + k] = c;
+        k = k + 1;
+    }
+    t[0] = pid;
+    t[1] = n;
+    return 0;
+}
+
+// ---- encoding ------------------------------------------------------------
+
+// Bytes the remaining length `n` takes.
+fn length_bytes(n: int) -> [] int {
+    if n < 128 {
+        return 1;
+    }
+    if n < 16384 {
+        return 2;
+    }
+    if n < 2097152 {
+        return 3;
+    }
+    return 4;
+}
+
+// The largest remaining length MQTT can express (268,435,455), above which no packet exists.
+fn remaining_limit() -> [] int {
+    return 268435455;
+}
+
+// Write the first byte and the remaining length at `at`; answers the offset after. The caller has checked there is room.
+fn put_header[&o](out: &!o [byte], at: int, first: int, remaining: int) -> [] int {
+    out[at] = byte_of(first);
+    var p = at + 1;
+    var n = remaining;
+    var going = true;
+    while going {
+        var b = n % 128;
+        n = n / 128;
+        if n > 0 {
+            b = b + 128;
+        } else {
+            going = false;
+        }
+        out[p] = byte_of(b);
+        p = p + 1;
+    }
+    return p;
+}
+
+fn put16[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    out[at] = byte_of(v >> 8 & 255);
+    out[at + 1] = byte_of(v & 255);
+    return at + 2;
+}
+
+// A length-prefixed string.
+fn put_string[&o, &s](out: &!o [byte], at: int, text: &s [byte]) -> [] int {
+    let p = put16(out, at, len(text));
+    return p + copy_into(out[p..len(out)], text);
+}
+
+// PUBACK: 4 bytes.
+pub fn put_puback[&o](out: &!o [byte], at: int, pid: int) -> [] int {
+    if pid < 1 || pid > 65535 {
+        return e_packet_id();
+    }
+    if at < 0 || at + 4 > len(out) {
+        return no_room();
+    }
+    out[at] = byte_of(64);
+    out[at + 1] = byte_of(2);
+    return put16(out, at + 2, pid);
+}
+
+pub fn put_pingreq[&o](out: &!o [byte], at: int) -> [] int {
+    if at < 0 || at + 2 > len(out) {
+        return no_room();
+    }
+    out[at] = byte_of(192);
+    out[at + 1] = byte_of(0);
+    return at + 2;
+}
+
+pub fn put_disconnect[&o](out: &!o [byte], at: int) -> [] int {
+    if at < 0 || at + 2 > len(out) {
+        return no_room();
+    }
+    out[at] = byte_of(224);
+    out[at + 1] = byte_of(0);
+    return at + 2;
+}
+
+// Size of the PUBLISH that `put_publish` would write.
+pub fn publish_size(topic_len: int, payload_len: int, qos: int) -> [] int {
+    var remaining = 2 + topic_len + payload_len;
+    if qos > 0 {
+        remaining = remaining + 2;
+    }
+    return 1 + length_bytes(remaining) + remaining;
+}
+
+// PUBLISH. Answers the offset after it, `no_room` when it does not fit in `out`, or the refusal for an argument that breaks a rule:
+// QoS 2 is `e_qos2`, any other QoS outside 0 and 1 `e_argument`, a bad topic name `e_topic`, a QoS 1 message without a packet id
+// (1 to 65535) `e_packet_id`.
+pub fn put_publish[&o, &t, &p](out: &!o [byte], at: int, topic: &t [byte], payload: &p [byte], qos: int, retain: int, dup: int, pid: int) -> [] int {
+    if qos == 2 {
+        return e_qos2();
+    }
+    if qos < 0 || qos > 1 || retain < 0 || retain > 1 || dup < 0 || dup > 1 || qos == 0 && dup == 1 {
+        return e_argument();
+    }
+    if !valid_name(topic) {
+        return e_topic();
+    }
+    if qos == 1 && (pid < 1 || pid > 65535) {
+        return e_packet_id();
+    }
+    var remaining = 2 + len(topic) + len(payload);
+    if qos > 0 {
+        remaining = remaining + 2;
+    }
+    if remaining > remaining_limit() {
+        return e_argument();
+    }
+    if at < 0 || at + 1 + length_bytes(remaining) + remaining > len(out) {
+        return no_room();
+    }
+    var first = 48 + (qos << 1) + retain;
+    if dup == 1 {
+        first = first + 8;
+    }
+    var q = put_header(out, at, first, remaining);
+    q = put_string(out, q, topic);
+    if qos > 0 {
+        q = put16(out, q, pid);
+    }
+    return q + copy_into(out[q..len(out)], payload);
+}
+
+// SUBSCRIBE (`with_qos`) or UNSUBSCRIBE of the filters `table` describes: `table[3k]` the offset in `data`, `table[3k + 1]` the length,
+// `table[3k + 2]` the requested QoS (0 or 1; ignored for an UNSUBSCRIBE), for `n` filters (1 to `max_filters`).
+fn put_filters[&o, &d, &t](out: &!o [byte], at: int, pid: int, data: &d [byte], table: &t [int], n: int, with_qos: bool) -> [] int {
+    if pid < 1 || pid > 65535 {
+        return e_packet_id();
+    }
+    if n < 1 || n > max_filters() || 3 * n > len(table) {
+        return e_filters();
+    }
+    var remaining = 2;
+    var k = 0;
+    while k < n {
+        let off = table[3 * k];
+        let l = table[3 * k + 1];
+        let q = table[3 * k + 2];
+        // The range is judged before the slice is taken.
+        if off < 0 || l < 0 || off + l > len(data) {
+            return e_topic();
+        }
+        if !valid_filter(data[off..off + l]) {
+            return e_topic();
+        }
+        if with_qos {
+            if q == 2 {
+                return e_qos2();
+            }
+            if q < 0 || q > 1 {
+                return e_argument();
+            }
+            remaining = remaining + 1;
+        }
+        remaining = remaining + 2 + l;
+        k = k + 1;
+    }
+    if at < 0 || at + 1 + length_bytes(remaining) + remaining > len(out) {
+        return no_room();
+    }
+    var first = 162;
+    if with_qos {
+        first = 130;
+    }
+    var p = put_header(out, at, first, remaining);
+    p = put16(out, p, pid);
+    k = 0;
+    while k < n {
+        let off = table[3 * k];
+        let l = table[3 * k + 1];
+        p = put_string(out, p, data[off..off + l]);
+        if with_qos {
+            out[p] = byte_of(table[3 * k + 2]);
+            p = p + 1;
+        }
+        k = k + 1;
+    }
+    return p;
+}
+
+pub fn put_subscribe[&o, &d, &t](out: &!o [byte], at: int, pid: int, data: &d [byte], table: &t [int], n: int) -> [] int {
+    return put_filters(out, at, pid, data, table, n, true);
+}
+
+pub fn put_unsubscribe[&o, &d, &t](out: &!o [byte], at: int, pid: int, data: &d [byte], table: &t [int], n: int) -> [] int {
+    return put_filters(out, at, pid, data, table, n, false);
+}
+
+// CONNECT. A user name is sent when `user` is not empty, a password when `pass` is not empty (and then `user` must be), a will when
+// `will_topic` is not empty. `client_id` may be empty only with `clean` (3.1.3.1). Answers the offset after the packet, `no_room`, or
+// `e_argument` for a field that breaks a rule (a password without a user name, a will QoS outside 0 and 1, a string over the limit, an
+// empty client id without a clean session, a keep-alive outside 0 to 65535), `e_qos2` for a will QoS 2, `e_topic` for a will topic that is
+// not a valid name.
+pub fn put_connect[&o, &c, &u, &w, &wt, &wm](out: &!o [byte], at: int, client_id: &c [byte], keepalive: int, clean_session: bool, user: &u [byte], pass: &w [byte], will_topic: &wt [byte], will_message: &wm [byte], will_qos: int, will_retain: int) -> [] int {
+    if keepalive < 0 || keepalive > 65535 {
+        return e_argument();
+    }
+    if len(client_id) > string_limit() || len(user) > string_limit() || len(pass) > string_limit() || len(will_message) > string_limit() {
+        return e_argument();
+    }
+    if len(client_id) == 0 && !clean_session {
+        return e_argument();
+    }
+    if len(client_id) > 0 && !clean(client_id, 0, len(client_id)) {
+        return e_argument();
+    }
+    if len(user) > 0 && !clean(user, 0, len(user)) {
+        return e_argument();
+    }
+    if len(pass) > 0 && len(user) == 0 {
+        return e_argument();
+    }
+    let has_will = len(will_topic) > 0;
+    if has_will {
+        if will_qos == 2 {
+            return e_qos2();
+        }
+        if will_qos < 0 || will_qos > 1 || will_retain < 0 || will_retain > 1 {
+            return e_argument();
+        }
+        if !valid_name(will_topic) {
+            return e_topic();
+        }
+    } else if will_qos != 0 || will_retain != 0 || len(will_message) > 0 {
+        return e_argument();
+    }
+    var flags_byte = 0;
+    if clean_session {
+        flags_byte = flags_byte + 2;
+    }
+    var remaining = 10 + 2 + len(client_id);
+    if has_will {
+        flags_byte = flags_byte + 4 + (will_qos << 3) + (will_retain << 5);
+        remaining = remaining + 2 + len(will_topic) + 2 + len(will_message);
+    }
+    if len(user) > 0 {
+        flags_byte = flags_byte + 128;
+        remaining = remaining + 2 + len(user);
+    }
+    if len(pass) > 0 {
+        flags_byte = flags_byte + 64;
+        remaining = remaining + 2 + len(pass);
+    }
+    if at < 0 || at + 1 + length_bytes(remaining) + remaining > len(out) {
+        return no_room();
+    }
+    var p = put_header(out, at, 16, remaining);
+    p = put_string(out, p, "MQTT");
+    out[p] = byte_of(4);
+    out[p + 1] = byte_of(flags_byte);
+    p = put16(out, p + 2, keepalive);
+    p = put_string(out, p, client_id);
+    if has_will {
+        p = put_string(out, p, will_topic);
+        p = put_string(out, p, will_message);
+    }
+    if len(user) > 0 {
+        p = put_string(out, p, user);
+    }
+    if len(pass) > 0 {
+        p = put_string(out, p, pass);
+    }
+    return p;
+}

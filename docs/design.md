@@ -331,3 +331,27 @@ without a second program that sits between client and broker); jitter; a total r
 - Mutants: 6 new variants, all killed (the four of `backoff_ms` and the two of `lost` and `open`).
 
 Not shown: the resend against a real broker that dropped a PUBACK; `watch` leaves the sleep as a spin on the clock.
+
+## 18. Slice 6: the package store (design, then what was built)
+
+**Decision.** Two published stores, like `cancho-pg`'s: `.cancho-vcs` holds `mqttc.codec` (`src/codec.cho`, requiring nothing) and `.cancho-vcs-client` holds `mqttc.client` (`src/client.cho`, requiring the
+names it calls of the codec's store, which it records by path relative to itself, so the two are committed side by side). A consumer does `cancho vcs lock --store S -o f NAME...` for the names it calls and
+`cancho vcs fetch --lock f --store S -o dir`, then builds with the fetched files. The compiler is the one `cancho.toml` pins (`a4572ea`, cancho-web's, the first consumer): a store records no hash of the
+`std` it was published against, so the pin is part of the contract (section 8, now closed).
+
+**The names a store requires are read from the source** (`codec.NAME` in `src/client.cho`), not written down: a list kept by hand drifts from the code it describes.
+
+**Gates, fixed before the stores were written:**
+
+1. `tests/stores.sh`: publish afresh into a scratch directory and require the committed stores equal it (`write` makes them equal). Variant: a source changed and the stores not rewritten.
+2. `tests/consume.sh EXAMPLE`: lock the names an example calls, fetch, build from the fetched files and not from `src/`, and require the same authority report as the source build (gate 4 of section 9: a `net_out`
+   and nothing else) and the same answer with no arguments. Variants: a source file of a store deleted; one byte of it changed; the client's store losing its source.
+3. `tests/consume.sh --out DIR` then `E2E_BIN=DIR scripts/e2e.sh`: the whole end-to-end run (QoS 0 and 1, retained, will, a watcher that outlives its broker) with the four programs built from the fetched stores.
+
+**What it found / said plainly.** A store holds one source file (`sources/`, all the published functions) and one file per published function (`ops/`) beside a manifest: 74 files and 68,378 bytes for the codec's, 48 files and 69,553 bytes for the client's, committed.
+`stores.sh` uses `cp -R`, not `rsync` (cancho-pg's uses `rsync`, which a stock machine may lack). The stale-store variant is caught only by `stores.sh`, and the deleted and altered ones only (also)
+by `consume.sh`: `stores.sh` compares the committed bytes with a fresh publication, `consume.sh` shows the committed stores can be used. A store that is stale but consistent passes `consume.sh`; that is
+what gate 1 is for.
+
+Measured here: `stores.sh` equal for both stores; `consume.sh` for `pub`, `sub`, `will` and `watch` (report equal, usage answer equal, exit 2); `scripts/e2e.sh` with the programs built from the stores passes
+exactly as with the programs built from the sources; four store variants killed.

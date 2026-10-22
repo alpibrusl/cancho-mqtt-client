@@ -74,6 +74,41 @@ EXPLAINED = {
 }
 
 
+# Breaks of the package stores (design section 18), each with the gate that must catch it: `stores` is `tests/stores.sh` (the committed stores are the stores of
+# the sources), `consume` is `tests/consume.sh` (a program built from the fetched stores is the program built from the sources).
+STORE_MUTANTS = {
+    "store-stale": ("a source changed and the committed store not rewritten", "stores"),
+    "store-loses-a-source": ("a source file of the codec's store is deleted", "consume"),
+    "store-source-altered": ("a source file of the codec's store has one byte changed", "consume"),
+    "client-store-loses-a-source": ("a source file of the client's store is deleted", "consume"),
+}
+
+
+def run_store_variant(name):
+    with tempfile.TemporaryDirectory() as d:
+        tree = pathlib.Path(d) / "tree"
+        shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(".git", "build"))
+        codec = tree / "src" / "codec.cho"
+        if name == "store-stale":
+            text = codec.read_text()
+            old = MUTANTS["length-edge-wrong"][1]
+            assert text.count(old) == 1
+            codec.write_text(text.replace(old, MUTANTS["length-edge-wrong"][2]))
+        else:
+            store = tree / (".cancho-vcs-client" if name.startswith("client") else ".cancho-vcs") / "sources"
+            victim = sorted(store.iterdir())[0]
+            if name == "store-source-altered":
+                victim.write_text(victim.read_text() + "\n// altered\n")
+            else:
+                victim.unlink()
+        failed = []
+        for gate, cmd in (("stores", ["sh", "tests/stores.sh"]), ("consume", ["sh", "tests/consume.sh", "pub"])):
+            r = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, env=dict(os.environ, CANCHO=CANCHO))
+            if r.returncode != 0:
+                failed.append(gate)
+        return failed
+
+
 def run(source_text, client_text=None):
     with tempfile.TemporaryDirectory() as d:
         codec = pathlib.Path(d) / "codec.cho"
@@ -131,6 +166,14 @@ def main():
         else:
             print(f"SURVIVED {name}: {what}")
             survivors.append(name)
+    store_survivors = []
+    for name, (what, gate) in STORE_MUTANTS.items():
+        failed = run_store_variant(name)
+        if gate in failed:
+            print(f"killed {name} (by {', '.join(failed)})")
+        else:
+            print(f"SURVIVED {name}: {what} (the {gate} gate did not fail; failed: {failed or 'none'})")
+            store_survivors.append(name)
     for name, (what, old, new, reason) in EXPLAINED.items():
         if base_client.count(old) != 1:
             print(f"BAD   {name}: the text to replace occurs {base_client.count(old)} times")
@@ -139,8 +182,8 @@ def main():
             print(f"KILLED {name}, which was written down as equivalent ({reason}): update EXPLAINED")
             return 1
         print(f"explained {name}: {reason}")
-    print(f"{len(everything) - len(survivors)} of {len(everything)} killed, {len(EXPLAINED)} explained")
-    return 1 if survivors else 0
+    print(f"{len(everything) - len(survivors)} of {len(everything)} killed, {len(STORE_MUTANTS) - len(store_survivors)} of {len(STORE_MUTANTS)} store variants killed, {len(EXPLAINED)} explained")
+    return 1 if survivors or store_survivors else 0
 
 
 if __name__ == "__main__":

@@ -63,6 +63,14 @@ jobs:
           $C test ../cancho-mqtt/src/wire.cho src/codec.cho tests/broker_test.cho --std
           $C test src/codec.cho src/client.cho tests/client_test.cho --std
 
+      - name: Gate, slice 6, the package stores are the stores of the sources, and a program built from the fetched stores is the program built from the sources
+        working-directory: client
+        env:
+          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
+        run: |
+          sh tests/stores.sh
+          for e in pub sub will watch; do sh tests/consume.sh $e; done
+
       - uses: actions/checkout@v4
         with:
           repository: alpibrusl/cancho
@@ -89,7 +97,10 @@ jobs:
         env:
           CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
           BROKER: ${{ github.workspace }}/cancho-mqtt/build/mqtt
-        run: scripts/e2e.sh
+        run: |
+          scripts/e2e.sh
+          sh tests/consume.sh --out "$RUNNER_TEMP/storebin"
+          E2E_BIN="$RUNNER_TEMP/storebin" scripts/e2e.sh 18831
 
       - name: Gate 7, every variant must be killed
         working-directory: client
