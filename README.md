@@ -4,7 +4,7 @@ An MQTT 3.1.1 client library for [cancho](https://github.com/alpibrusl/cancho), 
 QoS 0 and 1, and a reconnect with a bounded backoff. The other half of [cancho-mqtt](https://github.com/alpibrusl/cancho-mqtt): a cancho
 program can publish and subscribe without an external client.
 
-**Status: slices 1 to 5 built: the packet codec and the client state machine (connect, QoS 0 and QoS 1 publish with a window and held messages, subscribe, ping, disconnect, a will, retained messages), reconnect with a bounded backoff, with four example programs (`pub`, `sub`, `will`, `watch`) run against a real cancho-mqtt. The package store is not built.** The plan is [docs/design.md](docs/design.md), written before the code; its gates are fixed
+**Status: slices 1 to 6 built: the packet codec and the client state machine (connect, QoS 0 and QoS 1 publish with a window and held messages, subscribe, ping, disconnect, a will, retained messages), reconnect with a bounded backoff, with four example programs (`pub`, `sub`, `will`, `watch`) run against a real cancho-mqtt, and the package stores (`.cancho-vcs`, `.cancho-vcs-client`) a consumer fetches by name (design section 18).** The plan is [docs/design.md](docs/design.md), written before the code; its gates are fixed
 there and each is shown failing against a deliberately broken variant (`scripts/mutants.py`). The first user is the ingest and simulator of the PoC
 platform in [cancho-industrial](https://github.com/alpibrusl/cancho-industrial) (issue #7).
 
