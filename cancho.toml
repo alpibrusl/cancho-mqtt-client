@@ -3,7 +3,7 @@
 
 [package]
 name = "mqtt-client"
-cancho = "a4572ea3b506e4bcec1c4be43deda1043c11ba9f"
+cancho = "c4bcce0dbb4319ad38e1dae3a40711542de209cf"
 
 [[test]]
 name = "codec"
