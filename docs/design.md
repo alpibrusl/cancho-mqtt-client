@@ -126,7 +126,7 @@ below makes a disagreement a red build.
 A published package store (`.cancho-vcs`), like `cancho-pg` and `cancho-schema`: consumers `cancho vcs lock` / `fetch` it by commit, and
 a CI check (`tests/stores.sh`, as cancho-pg has) fails when the committed store is not the store of the sources. The compiler revision
 is part of the contract (a store records no hash of the `std` it was published against). **Open:** the compiler pin: the one
-cancho-web pins (`a4572ea`), because that is the first consumer.
+cancho-web pins (`53bee28`), because that is the first consumer.
 
 ## 9. Gates (fixed here, each shown failing with a variant)
 
@@ -155,7 +155,7 @@ cancho-web pins (`a4572ea`), because that is the first consumer.
 2. The memory formula: measure the state at several `Config`s; fix the defaults of section 5 from that.
 3. How a program reads a partial packet from a non-blocking connection at this pin (`cancho-pg`'s pool is the worked example).
 4. What cancho-mqtt's conformance fixtures offer to import for gate 2, and whether they can run unchanged.
-   *Answered in part (slice 1):* `mqtt.wire` itself compiles with the compiler this repository pins (`a4572ea`, the broker pins a newer one)
+   *Answered in part (slice 1):* `mqtt.wire` itself compiles with the compiler this repository pins (`53bee28`, the broker pins a newer one)
    and its own 10 tests pass there: `cancho test src/wire.cho tests/wire_test.cho --std` in a cancho-mqtt checkout. That is what made a
    differential against the real decoder possible without the broker's compiler. The broker's conformance fixtures (Python, over sockets)
    were not looked at; they belong to gate 3.
@@ -171,7 +171,7 @@ ingest and simulator (in cancho-industrial, not here).
 
 ## 12. Open questions for the owner
 
-1. The compiler pin: cancho-web's (`a4572ea`) or the broker's newer one (after the pin bump, cancho-industrial#3)?
+1. The compiler pin: cancho-web's (`53bee28`) or the broker's newer one (after the pin bump, cancho-industrial#3)?
 2. QoS 2 publishing: wanted for the PoC, or later?
 3. Is a `connect` helper in the library acceptable (it takes the caller's `Net`), or must the caller always hand in a connected stream?
 
@@ -336,7 +336,7 @@ Not shown: the resend against a real broker that dropped a PUBACK; `watch` leave
 
 **Decision.** Two published stores, like `cancho-pg`'s: `.cancho-vcs` holds `mqttc.codec` (`src/codec.cho`, requiring nothing) and `.cancho-vcs-client` holds `mqttc.client` (`src/client.cho`, requiring the
 names it calls of the codec's store, which it records by path relative to itself, so the two are committed side by side). A consumer does `cancho vcs lock --store S -o f NAME...` for the names it calls and
-`cancho vcs fetch --lock f --store S -o dir`, then builds with the fetched files. The compiler is the one `cancho.toml` pins (`a4572ea`, cancho-web's, the first consumer): a store records no hash of the
+`cancho vcs fetch --lock f --store S -o dir`, then builds with the fetched files. The compiler is the one `cancho.toml` pins (`53bee28`, cancho-web's, the first consumer): a store records no hash of the
 `std` it was published against, so the pin is part of the contract (section 8, now closed).
 
 **The names a store requires are read from the source** (`codec.NAME` in `src/client.cho`), not written down: a list kept by hand drifts from the code it describes.

@@ -10,7 +10,7 @@ env:
   # the broker's compiler (built below) claim to be this one, and `cancho build` of the broker would refuse it.
   # The compiler these sources are written for (also cancho.toml's `cancho`), and the cancho-mqtt commit whose `mqtt.wire` is the other
   # implementation of the byte layout (design section 9, gate 1): the commit cancho-industrial's bundle.toml pins.
-  CLIENT_COMPILER_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
+  CLIENT_COMPILER_REV: 53bee2852bacfb1692141cc2338bfc76fa79dd55
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
   # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
   BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
