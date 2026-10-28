@@ -13,7 +13,7 @@ env:
   CLIENT_COMPILER_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
   # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
-  BROKER_COMPILER_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
+  BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
 
 jobs:
   gate:
