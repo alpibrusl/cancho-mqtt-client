@@ -60,7 +60,7 @@ jobs:
         run: |
           C=${{ github.workspace }}/cancho/target/release/cancho
           $C test src/codec.cho tests/codec_test.cho --std
-          $C test ../cancho-mqtt/src/wire.cho src/codec.cho tests/broker_test.cho --std
+          $C test "$(cd .. && pwd)/cancho-mqtt/src/wire.cho" src/codec.cho tests/broker_test.cho --std
           $C test src/codec.cho src/client.cho tests/client_test.cho --std
 
       - name: Gate, slice 6, the package stores are the stores of the sources, and a program built from the fetched stores is the program built from the sources
