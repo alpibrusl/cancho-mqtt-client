@@ -10,7 +10,7 @@ env:
   # the broker's compiler (built below) claim to be this one, and `cancho build` of the broker would refuse it.
   # The compiler these sources are written for (also cancho.toml's `cancho`), and the cancho-mqtt commit whose `mqtt.wire` is the other
   # implementation of the byte layout (design section 9, gate 1): the commit cancho-industrial's bundle.toml pins.
-  CLIENT_COMPILER_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
+  CLIENT_COMPILER_REV: 471b8e9334e021123286db4b1cb9feaeba2677c5
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
   # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
   BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
@@ -49,7 +49,7 @@ jobs:
       - name: Build cancho
         if: steps.compiler.outputs.cache-hit != 'true'
         working-directory: cancho
-        run: cargo build --release -p cancho
+        run: scripts/install.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/cancho-release" && mkdir -p target/release && cp "$RUNNER_TEMP/cancho-release/bin/cancho" target/release/cancho
 
       - name: Format
         working-directory: client
@@ -89,7 +89,7 @@ jobs:
       - name: Build the broker with its own compiler
         if: steps.broker.outputs.cache-hit != 'true'
         run: |
-          (cd cancho-for-broker && cargo build --release -p cancho)
+          (cd cancho-for-broker && scripts/install.sh "$(git rev-parse HEAD)" "$RUNNER_TEMP/cancho-release" && mkdir -p target/release && cp "$RUNNER_TEMP/cancho-release/bin/cancho" target/release/cancho)
           (cd cancho-mqtt && ${{ github.workspace }}/cancho-for-broker/target/release/cancho build)
 
       - name: Gate 3, the examples against the real broker
