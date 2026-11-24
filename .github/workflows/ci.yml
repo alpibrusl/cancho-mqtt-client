@@ -6,14 +6,10 @@ on:
   pull_request:
 
 env:
-  # NOT named CANCHO_REV: cancho's build script stamps the compiler with that variable when it is set, so a workflow-level CANCHO_REV would make
-  # the broker's compiler (built below) claim to be this one, and `cancho build` of the broker would refuse it.
-  # The compiler these sources are written for (also cancho.toml's `cancho`), and the cancho-mqtt commit whose `mqtt.wire` is the other
-  # implementation of the byte layout (design section 9, gate 1): the commit cancho-industrial's bundle.toml pins.
-  CLIENT_COMPILER_REV: 6d753f5890b471ee81996e2c266ba08733f9654f
+  # The cancho-mqtt commit whose `mqtt.wire` is the other implementation of the byte layout (design section 9, gate 1): the commit
+  # cancho-industrial's bundle.toml pins. The compiler is the release pinned in cancho.toml, installed prebuilt; the broker is built by that
+  # same compiler (with --ignore-compiler-rev: its own cancho.toml names an older commit).
   BROKER_REV: ac2cde4434279d758dd8b4329a174f1fead6cb57
-  # The compiler that broker is written for (its cancho.toml), a different one: the broker is built by it, the client by the one above.
-  BROKER_COMPILER_REV: 53499414cc244d613f87c714f2ed2098d6974328
 
 jobs:
   gate:
@@ -25,77 +21,43 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: alpibrusl/cancho
-          ref: ${{ env.CLIENT_COMPILER_REV }}
-          path: cancho
-
-      - uses: actions/checkout@v4
-        with:
           repository: alpibrusl/cancho-mqtt
           ref: ${{ env.BROKER_REV }}
           path: cancho-mqtt
 
-      - name: The compiler pin in cancho.toml is the one CI builds
+      - name: Install the pinned compiler
         working-directory: client
-        run: grep -q "$CLIENT_COMPILER_REV" cancho.toml
-
-      - name: Cache the compiler
-        id: compiler
-        uses: actions/cache@v4
-        with:
-          path: cancho/target/release/cancho
-          key: cancho-${{ env.CLIENT_COMPILER_REV }}
-
-      - name: Build cancho
-        if: steps.compiler.outputs.cache-hit != 'true'
-        working-directory: cancho
-        run: cargo build --release -p cancho
+        run: |
+          pin=$(sed -n 's/^cancho *= *"\([0-9a-f.]*\)".*/\1/p' cancho.toml)
+          curl -fsSL https://raw.githubusercontent.com/alpibrusl/cancho/main/scripts/install.sh | sh -s "$pin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "CANCHO=$HOME/.local/bin/cancho" >> "$GITHUB_ENV"
 
       - name: Format
         working-directory: client
-        run: ${{ github.workspace }}/cancho/target/release/cancho fmt --check src tests examples
+        run: cancho fmt --check src tests examples
 
       - name: Gates 1, 2 and 6, the tests (the codec's own and against cancho-mqtt's wire)
         working-directory: client
         run: |
-          C=${{ github.workspace }}/cancho/target/release/cancho
-          $C test src/codec.cho tests/codec_test.cho --std
-          $C test ../cancho-mqtt/src/wire.cho src/codec.cho tests/broker_test.cho --std
-          $C test src/codec.cho src/client.cho tests/client_test.cho --std
+          cancho test src/codec.cho tests/codec_test.cho --std
+          # an absolute path: this compiler refuses a source path with `..` in it ("cannot read the file")
+          cancho test "$GITHUB_WORKSPACE/cancho-mqtt/src/wire.cho" src/codec.cho tests/broker_test.cho --std
+          cancho test src/codec.cho src/client.cho tests/client_test.cho --std
 
       - name: Gate, slice 6, the package stores are the stores of the sources, and a program built from the fetched stores is the program built from the sources
         working-directory: client
-        env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
         run: |
           sh tests/stores.sh
           for e in pub sub will watch; do sh tests/consume.sh $e; done
 
-      - uses: actions/checkout@v4
-        with:
-          repository: alpibrusl/cancho
-          ref: ${{ env.BROKER_COMPILER_REV }}
-          path: cancho-for-broker
-
-      - name: Cache the broker's compiler and the broker
-        id: broker
-        uses: actions/cache@v4
-        with:
-          path: |
-            cancho-for-broker/target/release/cancho
-            cancho-mqtt/build/mqtt
-          key: broker-${{ env.BROKER_COMPILER_REV }}-${{ env.BROKER_REV }}
-
-      - name: Build the broker with its own compiler
-        if: steps.broker.outputs.cache-hit != 'true'
-        run: |
-          (cd cancho-for-broker && cargo build --release -p cancho)
-          (cd cancho-mqtt && ${{ github.workspace }}/cancho-for-broker/target/release/cancho build)
+      - name: Build the broker
+        working-directory: cancho-mqtt
+        run: cancho build --ignore-compiler-rev
 
       - name: Gate 3, the examples against the real broker
         working-directory: client
         env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
           BROKER: ${{ github.workspace }}/cancho-mqtt/build/mqtt
         run: |
           scripts/e2e.sh
@@ -105,7 +67,6 @@ jobs:
       - name: Gate 7, every variant must be killed
         working-directory: client
         env:
-          CANCHO: ${{ github.workspace }}/cancho/target/release/cancho
           BROKER: ${{ github.workspace }}/cancho-mqtt/build/mqtt
         run: python3 scripts/mutants.py
 
